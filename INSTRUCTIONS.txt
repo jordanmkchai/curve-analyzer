@@ -1,0 +1,46 @@
+Curve Analyzer
+==============
+
+How to use
+----------
+
+1. Unzip the folder.
+2. Double-click "Curve Analyzer.exe".
+3. Click Browse and choose an Excel workbook.
+4. Put x values in column A and y values in column B.
+5. Choose one formula mode:
+   - Exact interpolated curve: passes through every point using a cubic spline.
+   - Sinusoidal best fit: fits y = A * sin(B*x + C) + D.
+6. Click Analyze and Export.
+
+Output
+------
+
+The app creates an Excel results workbook beside the input file:
+
+<input-file-name>_analysis_results.xlsx
+
+The results workbook contains:
+
+1. Area Results
+   - source file
+   - worksheet name
+   - analysis mode
+   - x range
+   - signed area under the curve
+   - absolute area under the curve
+
+2. Formulas
+   - exact mode: one cubic equation for each x interval
+   - sinusoidal mode: the fitted sinusoidal formula and parameters
+
+Notes
+-----
+
+Signed area is the mathematical integral. If part of the graph is below the
+x-axis, that part subtracts from the total.
+
+Absolute area treats all area as positive, even below the x-axis.
+
+For exact interpolation, the formula is piecewise. There is one cubic formula
+between each pair of x values.

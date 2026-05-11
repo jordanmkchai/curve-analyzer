@@ -1,0 +1,13 @@
+.venv/
+.vscode/
+__pycache__/
+build/
+dist/
+release/
+gh-auth.*
+*.pyc
+*.pyo
+*.log
+*_analysis_results.xlsx
+*_exact_formula.txt
+*_gui_export_test.xlsx

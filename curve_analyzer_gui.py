@@ -1,0 +1,456 @@
+import os
+import traceback
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
+
+import matplotlib
+
+matplotlib.use("TkAgg")
+
+import numpy as np
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+
+from sinusoidal_fit import (
+    build_sinusoid_formula_rows,
+    build_spline_formula_rows,
+    calculate_sinusoid_absolute_area,
+    calculate_sinusoid_area,
+    calculate_spline_area,
+    export_analysis_to_excel,
+    fit_sinusoidal,
+    format_sinusoid_equation,
+    load_xy_from_excel,
+    make_exact_spline,
+    sinusoid,
+)
+
+
+class CurveAnalyzerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Curve Analyzer")
+        self.root.geometry("1160x760")
+        self.root.minsize(980, 640)
+
+        self.file_path_var = tk.StringVar()
+        self.mode_var = tk.StringVar(value="exact")
+        self.status_var = tk.StringVar(value="Select an Excel file to begin.")
+        self.output_path_var = tk.StringVar(value="No results exported yet.")
+        self.last_result = None
+
+        self._build_ui()
+        self._draw_empty_plot()
+
+    def _build_ui(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TButton", padding=(10, 6))
+        style.configure("Primary.TButton", padding=(12, 7), font=("Segoe UI", 10, "bold"))
+        style.configure("Header.TLabel", font=("Segoe UI", 13, "bold"))
+
+        main = ttk.Frame(self.root, padding=14)
+        main.pack(fill=tk.BOTH, expand=True)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(3, weight=1)
+
+        header = ttk.Label(
+            main,
+            text="Curve Analyzer",
+            style="Header.TLabel",
+        )
+        header.grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        file_frame = ttk.LabelFrame(main, text="Excel File")
+        file_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        file_frame.columnconfigure(0, weight=1)
+
+        file_entry = ttk.Entry(file_frame, textvariable=self.file_path_var)
+        file_entry.grid(row=0, column=0, sticky="ew", padx=(10, 8), pady=10)
+
+        browse_button = ttk.Button(file_frame, text="Browse", command=self.browse_file)
+        browse_button.grid(row=0, column=1, padx=(0, 10), pady=10)
+
+        options = ttk.Frame(main)
+        options.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        options.columnconfigure(1, weight=1)
+
+        mode_frame = ttk.LabelFrame(options, text="Formula Mode")
+        mode_frame.grid(row=0, column=0, sticky="w")
+
+        ttk.Radiobutton(
+            mode_frame,
+            text="Exact interpolated curve",
+            variable=self.mode_var,
+            value="exact",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        ttk.Radiobutton(
+            mode_frame,
+            text="Sinusoidal best fit",
+            variable=self.mode_var,
+            value="sinusoid",
+        ).grid(row=1, column=0, sticky="w", padx=10, pady=(2, 8))
+
+        action_frame = ttk.Frame(options)
+        action_frame.grid(row=0, column=1, sticky="e")
+
+        self.analyze_button = ttk.Button(
+            action_frame,
+            text="Analyze and Export",
+            command=self.analyze,
+            style="Primary.TButton",
+        )
+        self.analyze_button.grid(row=0, column=0, padx=(0, 8))
+
+        self.export_button = ttk.Button(
+            action_frame,
+            text="Export As",
+            command=self.export_as,
+            state=tk.DISABLED,
+        )
+        self.export_button.grid(row=0, column=1, padx=(0, 8))
+
+        self.open_folder_button = ttk.Button(
+            action_frame,
+            text="Open Output Folder",
+            command=self.open_output_folder,
+            state=tk.DISABLED,
+        )
+        self.open_folder_button.grid(row=0, column=2)
+
+        content = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        content.grid(row=3, column=0, sticky="nsew")
+
+        left = ttk.Frame(content, padding=(0, 0, 10, 0))
+        right = ttk.Frame(content)
+        content.add(left, weight=1)
+        content.add(right, weight=3)
+
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        output_label = ttk.Label(left, textvariable=self.output_path_var, wraplength=320)
+        output_label.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+
+        self.summary_text = ScrolledText(
+            left,
+            width=42,
+            height=18,
+            wrap=tk.WORD,
+            font=("Consolas", 10),
+        )
+        self.summary_text.grid(row=1, column=0, sticky="nsew")
+        self.summary_text.configure(state=tk.DISABLED)
+
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        self.figure = Figure(figsize=(7, 5), dpi=100)
+        self.axis = self.figure.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=right)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        toolbar_frame = ttk.Frame(right)
+        toolbar_frame.grid(row=1, column=0, sticky="ew")
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
+
+        status = ttk.Label(main, textvariable=self.status_var, anchor="w")
+        status.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+
+    def browse_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Excel file",
+            filetypes=[
+                ("Excel workbooks", "*.xlsx *.xlsm"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if file_path:
+            self.file_path_var.set(file_path)
+            self.status_var.set("Excel file selected.")
+
+    def analyze(self):
+        file_path = Path(self.file_path_var.get().strip())
+
+        if not file_path:
+            messagebox.showwarning("No file selected", "Please choose an Excel file.")
+            return
+
+        if not file_path.exists():
+            messagebox.showerror("File not found", f"Could not find:\n{file_path}")
+            return
+
+        self._set_busy(True)
+
+        try:
+            result = self._build_result(file_path)
+            output_path = file_path.with_name(f"{file_path.stem}_analysis_results.xlsx")
+            export_analysis_to_excel(
+                output_path,
+                result["metadata_rows"],
+                result["area_rows"],
+                result["formula_rows"],
+            )
+
+            result["output_path"] = output_path
+            self.last_result = result
+
+            self._write_summary(result)
+            self._draw_result(result)
+            self.output_path_var.set(f"Results exported to: {output_path}")
+            self.status_var.set("Analysis complete.")
+            self.export_button.configure(state=tk.NORMAL)
+            self.open_folder_button.configure(state=tk.NORMAL)
+        except Exception as error:
+            traceback.print_exc()
+            messagebox.showerror("Analysis failed", str(error))
+            self.status_var.set("Analysis failed.")
+        finally:
+            self._set_busy(False)
+
+    def _build_result(self, file_path):
+        x_data, y_data, sheet_name, used_rows, skipped_rows = load_xy_from_excel(file_path)
+        mode = self.mode_var.get()
+
+        if mode == "sinusoid":
+            A, B, C, D = fit_sinusoidal(x_data, y_data)
+            x_min = float(np.min(x_data))
+            x_max = float(np.max(x_data))
+            signed_area = calculate_sinusoid_area(A, B, C, D, x_min, x_max)
+            absolute_area = calculate_sinusoid_absolute_area(A, B, C, D, x_min, x_max)
+            equation = format_sinusoid_equation(A, B, C, D)
+
+            metadata_rows = [
+                ("Source file", str(file_path)),
+                ("Worksheet", sheet_name),
+                ("Analysis mode", "Sinusoidal best fit"),
+                ("Numeric data rows used", used_rows),
+                ("Rows skipped", skipped_rows),
+                ("Formula type", "y = A * sin(B*x + C) + D"),
+            ]
+            area_rows = [
+                ("x start", x_min),
+                ("x end", x_max),
+                ("Signed area under curve", signed_area),
+                ("Absolute area under curve", absolute_area),
+            ]
+
+            return {
+                "mode": "sinusoid",
+                "source_file": file_path,
+                "sheet_name": sheet_name,
+                "x": x_data,
+                "y": y_data,
+                "parameters": (A, B, C, D),
+                "signed_area": signed_area,
+                "absolute_area": absolute_area,
+                "equation": equation,
+                "metadata_rows": metadata_rows,
+                "area_rows": area_rows,
+                "formula_rows": build_sinusoid_formula_rows(A, B, C, D),
+            }
+
+        x_data, y_data, spline = make_exact_spline(x_data, y_data)
+        signed_area, absolute_area = calculate_spline_area(spline, x_data[0], x_data[-1])
+
+        metadata_rows = [
+            ("Source file", str(file_path)),
+            ("Worksheet", sheet_name),
+            ("Analysis mode", "Exact cubic spline interpolation"),
+            ("Numeric data rows used", used_rows),
+            ("Rows skipped", skipped_rows),
+            ("Unique x values", len(x_data)),
+            (
+                "Formula type",
+                "Piecewise cubic spline: y = a*(x-x0)^3 + b*(x-x0)^2 + c*(x-x0) + d",
+            ),
+        ]
+        area_rows = [
+            ("x start", float(x_data[0])),
+            ("x end", float(x_data[-1])),
+            ("Signed area under curve", signed_area),
+            ("Absolute area under curve", absolute_area),
+        ]
+
+        return {
+            "mode": "exact",
+            "source_file": file_path,
+            "sheet_name": sheet_name,
+            "x": x_data,
+            "y": y_data,
+            "spline": spline,
+            "signed_area": signed_area,
+            "absolute_area": absolute_area,
+            "metadata_rows": metadata_rows,
+            "area_rows": area_rows,
+            "formula_rows": build_spline_formula_rows(x_data, spline),
+        }
+
+    def export_as(self):
+        if not self.last_result:
+            messagebox.showwarning("No results", "Run an analysis first.")
+            return
+
+        source_file = self.last_result["source_file"]
+        output_path = filedialog.asksaveasfilename(
+            title="Save results workbook",
+            initialdir=str(source_file.parent),
+            initialfile=f"{source_file.stem}_analysis_results.xlsx",
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbook", "*.xlsx")],
+        )
+
+        if not output_path:
+            return
+
+        try:
+            export_analysis_to_excel(
+                output_path,
+                self.last_result["metadata_rows"],
+                self.last_result["area_rows"],
+                self.last_result["formula_rows"],
+            )
+            self.last_result["output_path"] = Path(output_path)
+            self.output_path_var.set(f"Results exported to: {output_path}")
+            self.status_var.set("Results exported.")
+            self.open_folder_button.configure(state=tk.NORMAL)
+        except Exception as error:
+            traceback.print_exc()
+            messagebox.showerror("Export failed", str(error))
+
+    def open_output_folder(self):
+        if not self.last_result or "output_path" not in self.last_result:
+            messagebox.showwarning("No output", "Export results first.")
+            return
+
+        output_path = Path(self.last_result["output_path"])
+        if output_path.exists():
+            os.startfile(output_path.parent)
+        else:
+            os.startfile(output_path.parent if output_path.parent.exists() else ".")
+
+    def _write_summary(self, result):
+        lines = [
+            f"Source: {result['source_file']}",
+            f"Worksheet: {result['sheet_name']}",
+            "",
+            f"Mode: {'Exact cubic spline interpolation' if result['mode'] == 'exact' else 'Sinusoidal best fit'}",
+            f"x start: {result['area_rows'][0][1]:.6f}",
+            f"x end:   {result['area_rows'][1][1]:.6f}",
+            "",
+            f"Signed area:   {result['signed_area']:.6f}",
+            f"Absolute area: {result['absolute_area']:.6f}",
+        ]
+
+        if result["mode"] == "sinusoid":
+            A, B, C, D = result["parameters"]
+            lines.extend(
+                [
+                    "",
+                    "Equation:",
+                    result["equation"],
+                    "",
+                    f"A = {A:.8g}",
+                    f"B = {B:.8g}",
+                    f"C = {C:.8g}",
+                    f"D = {D:.8g}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    f"Piecewise formulas: {len(result['formula_rows'])}",
+                    "The formulas are saved on the Formulas sheet.",
+                ]
+            )
+
+        self.summary_text.configure(state=tk.NORMAL)
+        self.summary_text.delete("1.0", tk.END)
+        self.summary_text.insert(tk.END, "\n".join(lines))
+        self.summary_text.configure(state=tk.DISABLED)
+
+    def _draw_empty_plot(self):
+        self.axis.clear()
+        self.axis.set_title("No data loaded")
+        self.axis.set_xlabel("x")
+        self.axis.set_ylabel("y")
+        self.axis.grid(True)
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _draw_result(self, result):
+        self.axis.clear()
+
+        x_data = result["x"]
+        y_data = result["y"]
+
+        if result["mode"] == "sinusoid":
+            A, B, C, D = result["parameters"]
+            x_fit = np.linspace(np.min(x_data), np.max(x_data), 1200)
+            y_fit = sinusoid(x_fit, A, B, C, D)
+            line_label = "Fitted curve"
+            title = f"Sinusoidal Best Fit: {result['source_file'].name}"
+            plot_note = (
+                f"{result['equation']}\n"
+                f"Signed area = {result['signed_area']:.4f}\n"
+                f"Absolute area = {result['absolute_area']:.4f}"
+            )
+        else:
+            spline = result["spline"]
+            x_fit = np.linspace(np.min(x_data), np.max(x_data), 2000)
+            y_fit = spline(x_fit)
+            line_label = "Exact interpolated curve"
+            title = f"Exact Interpolated Curve: {result['source_file'].name}"
+            plot_note = (
+                "Exact cubic spline interpolation\n"
+                f"Signed area = {result['signed_area']:.4f}\n"
+                f"Absolute area = {result['absolute_area']:.4f}"
+            )
+
+        self.axis.scatter(x_data, y_data, label="Original data", color="#1f5cff", s=28)
+        self.axis.plot(x_fit, y_fit, label=line_label, color="#d7191c", linewidth=2)
+        self.axis.fill_between(
+            x_fit,
+            y_fit,
+            0,
+            color="#d7191c",
+            alpha=0.12,
+            label="Area under curve",
+        )
+        self.axis.set_title(title)
+        self.axis.set_xlabel("x")
+        self.axis.set_ylabel("y")
+        self.axis.grid(True)
+        self.axis.legend(loc="best")
+        self.axis.text(
+            0.02,
+            0.98,
+            plot_note,
+            transform=self.axis.transAxes,
+            verticalalignment="top",
+            bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "gray"},
+        )
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _set_busy(self, busy):
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.analyze_button.configure(state=state)
+        self.status_var.set("Working..." if busy else self.status_var.get())
+        self.root.update_idletasks()
+
+
+def main():
+    root = tk.Tk()
+    app = CurveAnalyzerApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
