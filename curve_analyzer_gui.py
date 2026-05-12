@@ -1,6 +1,7 @@
 import os
 import traceback
 from pathlib import Path
+from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -14,16 +15,21 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 from sinusoidal_fit import (
+    build_spike_metric_rows,
     build_sinusoid_formula_rows,
     build_spline_formula_rows,
+    build_average_spike_from_tsvs,
     calculate_sinusoid_absolute_area,
     calculate_sinusoid_area,
     calculate_spline_area,
+    calculate_spike_metrics,
+    export_average_spikes_to_excel,
     export_analysis_to_excel,
     fit_sinusoidal,
     format_sinusoid_equation,
     load_xy_from_excel,
     make_exact_spline,
+    save_average_spike_plot,
     sinusoid,
 )
 
@@ -40,6 +46,9 @@ class CurveAnalyzerApp:
         self.status_var = tk.StringVar(value="Select an Excel file to begin.")
         self.output_path_var = tk.StringVar(value="No results exported yet.")
         self.last_result = None
+        self.note_artist = None
+        self.metric_text_artists = []
+        self._drag_artist = None
 
         self._build_ui()
         self._draw_empty_plot()
@@ -121,6 +130,13 @@ class CurveAnalyzerApp:
         )
         self.open_folder_button.grid(row=0, column=2)
 
+        self.average_tsv_button = ttk.Button(
+            action_frame,
+            text="Average Spikes",
+            command=self.average_tsv_spikes,
+        )
+        self.average_tsv_button.grid(row=0, column=3, padx=(8, 0))
+
         content = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
         content.grid(row=3, column=0, sticky="nsew")
 
@@ -195,6 +211,7 @@ class CurveAnalyzerApp:
                 result["metadata_rows"],
                 result["area_rows"],
                 result["formula_rows"],
+                result["spike_metric_rows"],
             )
 
             result["output_path"] = output_path
@@ -216,6 +233,8 @@ class CurveAnalyzerApp:
     def _build_result(self, file_path):
         x_data, y_data, sheet_name, used_rows, skipped_rows = load_xy_from_excel(file_path)
         mode = self.mode_var.get()
+        spike_metrics = calculate_spike_metrics(x_data, y_data)
+        spike_metric_rows = build_spike_metric_rows(spike_metrics)
 
         if mode == "sinusoid":
             A, B, C, D = fit_sinusoidal(x_data, y_data)
@@ -253,6 +272,8 @@ class CurveAnalyzerApp:
                 "metadata_rows": metadata_rows,
                 "area_rows": area_rows,
                 "formula_rows": build_sinusoid_formula_rows(A, B, C, D),
+                "spike_metrics": spike_metrics,
+                "spike_metric_rows": spike_metric_rows,
             }
 
         x_data, y_data, spline = make_exact_spline(x_data, y_data)
@@ -289,6 +310,112 @@ class CurveAnalyzerApp:
             "metadata_rows": metadata_rows,
             "area_rows": area_rows,
             "formula_rows": build_spline_formula_rows(x_data, spline),
+            "spike_metrics": spike_metrics,
+            "spike_metric_rows": spike_metric_rows,
+        }
+
+    def average_tsv_spikes(self):
+        file_paths = filedialog.askopenfilenames(
+            title="Select TSV files with EEG spikes",
+            filetypes=[
+                ("TSV/TXT/CSV files", "*.tsv *.txt *.csv"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not file_paths:
+            return
+
+        self._set_busy(True)
+
+        try:
+            average_result = build_average_spike_from_tsvs(
+                file_paths,
+                progress_callback=self._set_average_progress,
+            )
+            first_file = Path(file_paths[0])
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_excel = first_file.with_name(f"average_epileptiform_spikes_{stamp}.xlsx")
+            output_plot = first_file.with_name(f"average_epileptiform_spikes_{stamp}.png")
+
+            export_average_spikes_to_excel(output_excel, average_result)
+            save_average_spike_plot(output_plot, average_result)
+
+            result = self._build_average_spike_analysis_result(
+                output_excel,
+                average_result,
+            )
+            result["output_path"] = output_excel
+            self.last_result = result
+
+            self._write_summary(result)
+            self._draw_result(result)
+            self.output_path_var.set(
+                f"Average spike exported to: {output_excel}\nGraph exported to: {output_plot}"
+            )
+            self.status_var.set(
+                f"Average complete: {len(average_result['spikes'])} spikes used."
+            )
+            self.export_button.configure(state=tk.NORMAL)
+            self.open_folder_button.configure(state=tk.NORMAL)
+        except Exception as error:
+            traceback.print_exc()
+            messagebox.showerror("Average spikes failed", str(error))
+            self.status_var.set("Average spikes failed.")
+        finally:
+            self._set_busy(False)
+
+    def _set_average_progress(self, message):
+        self.status_var.set(message)
+        self.summary_text.configure(state=tk.NORMAL)
+        self.summary_text.delete("1.0", tk.END)
+        self.summary_text.insert(tk.END, message)
+        self.summary_text.configure(state=tk.DISABLED)
+        self.root.update_idletasks()
+
+    def _build_average_spike_analysis_result(self, source_file, average_result):
+        x_data, y_data, spline = make_exact_spline(
+            average_result["x_ms"],
+            average_result["average_y"],
+        )
+        signed_area, absolute_area = calculate_spline_area(spline, x_data[0], x_data[-1])
+        spike_metrics = calculate_spike_metrics(x_data, y_data)
+        spike_metric_rows = build_spike_metric_rows(spike_metrics)
+
+        metadata_rows = [
+            ("Source file", str(source_file)),
+            ("Worksheet", "Average Spike"),
+            ("Analysis mode", "Average TSV epileptiform spike"),
+            ("Spikes averaged", len(average_result["spikes"])),
+            ("Files analysed", len(average_result["file_rows"])),
+            ("Pre-peak window (ms)", average_result["pre_ms"]),
+            ("Post-peak window (ms)", average_result["post_ms"]),
+            (
+                "Formula type",
+                "Piecewise cubic spline: y = a*(x-x0)^3 + b*(x-x0)^2 + c*(x-x0) + d",
+            ),
+        ]
+        area_rows = [
+            ("x start", float(x_data[0])),
+            ("x end", float(x_data[-1])),
+            ("Signed area under curve", signed_area),
+            ("Absolute area under curve", absolute_area),
+        ]
+
+        return {
+            "mode": "average_spike",
+            "source_file": Path(source_file),
+            "sheet_name": "Average Spike",
+            "x": x_data,
+            "y": y_data,
+            "spline": spline,
+            "signed_area": signed_area,
+            "absolute_area": absolute_area,
+            "metadata_rows": metadata_rows,
+            "area_rows": area_rows,
+            "formula_rows": build_spline_formula_rows(x_data, spline),
+            "spike_metrics": spike_metrics,
+            "spike_metric_rows": spike_metric_rows,
         }
 
     def export_as(self):
@@ -314,6 +441,7 @@ class CurveAnalyzerApp:
                 self.last_result["metadata_rows"],
                 self.last_result["area_rows"],
                 self.last_result["formula_rows"],
+                self.last_result["spike_metric_rows"],
             )
             self.last_result["output_path"] = Path(output_path)
             self.output_path_var.set(f"Results exported to: {output_path}")
@@ -339,12 +467,30 @@ class CurveAnalyzerApp:
             f"Source: {result['source_file']}",
             f"Worksheet: {result['sheet_name']}",
             "",
-            f"Mode: {'Exact cubic spline interpolation' if result['mode'] == 'exact' else 'Sinusoidal best fit'}",
+            f"Mode: {self._mode_label(result)}",
             f"x start: {result['area_rows'][0][1]:.6f}",
             f"x end:   {result['area_rows'][1][1]:.6f}",
             "",
             f"Signed area:   {result['signed_area']:.6f}",
             f"Absolute area: {result['absolute_area']:.6f}",
+            "",
+            "Spike metrics:",
+            f"Baseline y: {result['spike_metrics']['Baseline y (median)']:.6f}",
+            f"Polarity: {result['spike_metrics']['Spike polarity']}",
+            f"Peak x: {result['spike_metrics']['Peak x']:.6f}",
+            f"Peak y: {result['spike_metrics']['Peak y']:.6f}",
+            (
+                "Peak amplitude: "
+                f"{result['spike_metrics']['Peak amplitude (absolute from baseline)']:.6f}"
+            ),
+            self._format_optional_metric(
+                "Rise time (10-90%)",
+                result["spike_metrics"]["Rise time (10-90%)"],
+            ),
+            self._format_optional_metric(
+                "Decay time (90-10%)",
+                result["spike_metrics"]["Decay time (90-10%)"],
+            ),
         ]
 
         if result["mode"] == "sinusoid":
@@ -375,8 +521,22 @@ class CurveAnalyzerApp:
         self.summary_text.insert(tk.END, "\n".join(lines))
         self.summary_text.configure(state=tk.DISABLED)
 
+    def _mode_label(self, result):
+        if result["mode"] == "exact":
+            return "Exact cubic spline interpolation"
+        if result["mode"] == "sinusoid":
+            return "Sinusoidal best fit"
+        return "Average TSV epileptiform spike"
+
+    def _format_optional_metric(self, label, value):
+        if value is None:
+            return f"{label}: not found"
+        return f"{label}: {value:.6f}"
+
     def _draw_empty_plot(self):
         self.axis.clear()
+        self.note_artist = None
+        self.metric_text_artists = []
         self.axis.set_title("No data loaded")
         self.axis.set_xlabel("x")
         self.axis.set_ylabel("y")
@@ -386,9 +546,12 @@ class CurveAnalyzerApp:
 
     def _draw_result(self, result):
         self.axis.clear()
+        self.note_artist = None
+        self.metric_text_artists = []
 
         x_data = result["x"]
         y_data = result["y"]
+        spike_metrics = result["spike_metrics"]
 
         if result["mode"] == "sinusoid":
             A, B, C, D = result["parameters"]
@@ -406,15 +569,31 @@ class CurveAnalyzerApp:
             x_fit = np.linspace(np.min(x_data), np.max(x_data), 2000)
             y_fit = spline(x_fit)
             line_label = "Exact interpolated curve"
-            title = f"Exact Interpolated Curve: {result['source_file'].name}"
+            if result["mode"] == "average_spike":
+                line_label = "Average spike curve"
+                title = f"Average Epileptiform Spike: {result['source_file'].name}"
+            else:
+                title = f"Exact Interpolated Curve: {result['source_file'].name}"
             plot_note = (
                 "Exact cubic spline interpolation\n"
                 f"Signed area = {result['signed_area']:.4f}\n"
                 f"Absolute area = {result['absolute_area']:.4f}"
             )
 
-        self.axis.scatter(x_data, y_data, label="Original data", color="#1f5cff", s=28)
+        scatter_label = "Average spike data" if result["mode"] == "average_spike" else "Original data"
+        self.axis.scatter(x_data, y_data, label=scatter_label, color="#1f5cff", s=28)
         self.axis.plot(x_fit, y_fit, label=line_label, color="#d7191c", linewidth=2)
+        self.axis.scatter(
+            [spike_metrics["Peak x"]],
+            [spike_metrics["Peak y"]],
+            label="Peak amplitude",
+            color="#111111",
+            s=50,
+            marker="x",
+            linewidths=2,
+            zorder=5,
+        )
+        self._draw_spike_metric_markers(result, x_fit, y_fit)
         self.axis.fill_between(
             x_fit,
             y_fit,
@@ -427,8 +606,9 @@ class CurveAnalyzerApp:
         self.axis.set_xlabel("x")
         self.axis.set_ylabel("y")
         self.axis.grid(True)
-        self.axis.legend(loc="best")
-        self.axis.text(
+        legend = self.axis.legend(loc="best")
+        legend.set_draggable(True)
+        self.note_artist = self.axis.text(
             0.02,
             0.98,
             plot_note,
@@ -436,8 +616,137 @@ class CurveAnalyzerApp:
             verticalalignment="top",
             bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "gray"},
         )
+        self.note_artist.set_picker(True)
+        self._connect_note_dragging()
         self.figure.tight_layout()
         self.canvas.draw()
+
+    def _draw_spike_metric_markers(self, result, x_fit, y_fit):
+        spike_metrics = result["spike_metrics"]
+        baseline = spike_metrics["Baseline y (median)"]
+        peak_x = spike_metrics["Peak x"]
+        peak_y = spike_metrics["Peak y"]
+        amplitude = spike_metrics["Peak amplitude (absolute from baseline)"]
+
+        self.axis.axhline(
+            baseline,
+            color="#555555",
+            linewidth=1,
+            linestyle=":",
+            label="Baseline",
+        )
+        self.axis.annotate(
+            "",
+            xy=(peak_x, peak_y),
+            xytext=(peak_x, baseline),
+            arrowprops={
+                "arrowstyle": "<->",
+                "color": "#111111",
+                "linewidth": 1.6,
+            },
+        )
+        amplitude_text = self.axis.text(
+            peak_x,
+            (peak_y + baseline) / 2,
+            f"Amplitude\n{amplitude:.4g}",
+            color="#111111",
+            fontsize=9,
+            ha="left",
+            va="center",
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+        )
+        amplitude_text.set_picker(True)
+        self.metric_text_artists.append(amplitude_text)
+
+        self._draw_time_range(
+            x_fit,
+            y_fit,
+            spike_metrics["Rise start x (10% amplitude)"],
+            spike_metrics["Rise end x (90% amplitude)"],
+            "Rise time",
+            "#238b45",
+        )
+        self._draw_time_range(
+            x_fit,
+            y_fit,
+            spike_metrics["Decay start x (90% amplitude)"],
+            spike_metrics["Decay end x (10% amplitude)"],
+            "Decay time",
+            "#f16913",
+        )
+
+    def _draw_time_range(self, x_fit, y_fit, x_start, x_end, label, color):
+        if x_start is None or x_end is None:
+            return
+
+        if np.isclose(x_start, x_end):
+            return
+
+        start_y = float(np.interp(x_start, x_fit, y_fit))
+        end_y = float(np.interp(x_end, x_fit, y_fit))
+        mid_x = (x_start + x_end) / 2
+        mid_y = float(np.interp(mid_x, x_fit, y_fit))
+
+        self.axis.plot(
+            [x_start, x_end],
+            [start_y, end_y],
+            color=color,
+            linewidth=4,
+            solid_capstyle="round",
+            label=label,
+            zorder=4,
+        )
+        self.axis.scatter(
+            [x_start, x_end],
+            [start_y, end_y],
+            color=color,
+            s=36,
+            zorder=6,
+        )
+        label_text = self.axis.text(
+            mid_x,
+            mid_y,
+            f"{label}\n{x_end - x_start:.4g}",
+            color=color,
+            fontsize=9,
+            ha="center",
+            va="bottom",
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+        )
+        label_text.set_picker(True)
+        self.metric_text_artists.append(label_text)
+
+    def _connect_note_dragging(self):
+        if hasattr(self, "_drag_connections_ready") and self._drag_connections_ready:
+            return
+
+        self.canvas.mpl_connect("button_press_event", self._on_plot_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_plot_release)
+        self._drag_connections_ready = True
+
+    def _on_plot_press(self, event):
+        if event.inaxes != self.axis:
+            return
+
+        for artist in [self.note_artist, *self.metric_text_artists]:
+            if artist is None:
+                continue
+            contains, _ = artist.contains(event)
+            if contains:
+                self._drag_artist = artist
+                return
+
+    def _on_plot_motion(self, event):
+        if self._drag_artist is None or event.inaxes != self.axis:
+            return
+
+        self._drag_artist.set_position((event.xdata, event.ydata))
+        self._drag_artist.set_transform(self.axis.transData)
+        self.canvas.draw_idle()
+
+    def _on_plot_release(self, event):
+        self._drag_artist = None
 
     def _set_busy(self, busy):
         state = tk.DISABLED if busy else tk.NORMAL

@@ -1,13 +1,22 @@
 import sys
+import os
+import importlib.util
 from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 from scipy.interpolate import CubicSpline
 from scipy.optimize import curve_fit
+from scipy.signal import butter, find_peaks, iirnotch, sosfiltfilt, filtfilt, sosfilt, resample_poly
+from scipy.ndimage import median_filter
+from scipy.stats import median_abs_deviation
+
+
+EEG_ECG_ANALYSER_PATH = Path(r"D:\eeg_ecg_analyser\eeg_ecg analyser 2.py")
 
 
 def sinusoid(x, A, B, C, D):
@@ -177,6 +186,629 @@ def calculate_sinusoid_absolute_area(A, B, C, D, x_min, x_max):
     return float(absolute_area)
 
 
+def _interpolated_x_at_level(x0, y0, x1, y1, level):
+    """Return linearly interpolated x where y crosses level."""
+    if np.isclose(y1, y0):
+        return float(x0)
+
+    fraction = (level - y0) / (y1 - y0)
+    return float(x0 + fraction * (x1 - x0))
+
+
+def _find_left_crossing(x_values, signal, peak_index, level):
+    for index in range(peak_index - 1, -1, -1):
+        if signal[index] <= level <= signal[index + 1]:
+            return _interpolated_x_at_level(
+                x_values[index],
+                signal[index],
+                x_values[index + 1],
+                signal[index + 1],
+                level,
+            )
+
+    return None
+
+
+def _find_right_crossing(x_values, signal, peak_index, level):
+    for index in range(peak_index, len(signal) - 1):
+        if signal[index] >= level >= signal[index + 1]:
+            return _interpolated_x_at_level(
+                x_values[index],
+                signal[index],
+                x_values[index + 1],
+                signal[index + 1],
+                level,
+            )
+
+    return None
+
+
+def calculate_spike_metrics(x_values, y_values):
+    """Calculate dominant epileptiform spike morphology from x,y trace data."""
+    x_values, y_values = prepare_xy_values(x_values, y_values)
+
+    baseline = float(np.median(y_values))
+    positive_peak_index = int(np.argmax(y_values - baseline))
+    negative_peak_index = int(np.argmax(baseline - y_values))
+
+    positive_amplitude = float(y_values[positive_peak_index] - baseline)
+    negative_amplitude = float(baseline - y_values[negative_peak_index])
+
+    if positive_amplitude >= negative_amplitude:
+        peak_index = positive_peak_index
+        polarity = "positive"
+        signed_amplitude = positive_amplitude
+        signal = y_values - baseline
+    else:
+        peak_index = negative_peak_index
+        polarity = "negative"
+        signed_amplitude = -negative_amplitude
+        signal = baseline - y_values
+
+    peak_amplitude = float(abs(signed_amplitude))
+    peak_x = float(x_values[peak_index])
+    peak_y = float(y_values[peak_index])
+
+    if np.isclose(peak_amplitude, 0):
+        raise ValueError("Could not calculate spike metrics because peak amplitude is 0.")
+
+    level_10 = peak_amplitude * 0.10
+    level_90 = peak_amplitude * 0.90
+
+    rise_10_x = _find_left_crossing(x_values, signal, peak_index, level_10)
+    rise_90_x = _find_left_crossing(x_values, signal, peak_index, level_90)
+    decay_90_x = _find_right_crossing(x_values, signal, peak_index, level_90)
+    decay_10_x = _find_right_crossing(x_values, signal, peak_index, level_10)
+
+    rise_time = None
+    if rise_10_x is not None and rise_90_x is not None:
+        rise_time = float(rise_90_x - rise_10_x)
+
+    decay_time = None
+    if decay_90_x is not None and decay_10_x is not None:
+        decay_time = float(decay_10_x - decay_90_x)
+
+    duration_10_to_10 = None
+    if rise_10_x is not None and decay_10_x is not None:
+        duration_10_to_10 = float(decay_10_x - rise_10_x)
+
+    return {
+        "Baseline y (median)": baseline,
+        "Spike polarity": polarity,
+        "Peak x": peak_x,
+        "Peak y": peak_y,
+        "Peak amplitude (signed from baseline)": signed_amplitude,
+        "Peak amplitude (absolute from baseline)": peak_amplitude,
+        "Rise start x (10% amplitude)": rise_10_x,
+        "Rise end x (90% amplitude)": rise_90_x,
+        "Rise time (10-90%)": rise_time,
+        "Decay start x (90% amplitude)": decay_90_x,
+        "Decay end x (10% amplitude)": decay_10_x,
+        "Decay time (90-10%)": decay_time,
+        "Spike duration (10-10%)": duration_10_to_10,
+        "Measurement note": (
+            "Baseline is median y. Peak is largest absolute deflection from baseline. "
+            "Rise and decay use linear interpolation between sampled x,y points."
+        ),
+    }
+
+
+def build_spike_metric_rows(spike_metrics):
+    """Build rows for the Spike Metrics export sheet."""
+    rows = []
+
+    for metric, value in spike_metrics.items():
+        rows.append(
+            {
+                "Metric": metric,
+                "Value": "" if value is None else value,
+            }
+        )
+
+    return rows
+
+
+def infer_sampling_rate_from_time(x_values):
+    """Infer sampling rate from x values, converting milliseconds to seconds if needed."""
+    x_values = np.asarray(x_values, dtype=float)
+    if len(x_values) < 3:
+        raise ValueError("At least 3 time points are required.")
+
+    dt = np.diff(x_values)
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if len(dt) == 0:
+        raise ValueError("Could not infer sampling rate from time column.")
+
+    dt_median = float(np.median(dt))
+    time_scale = 1.0
+    fs = 1.0 / dt_median
+
+    if fs < 50:
+        time_scale = 0.001
+        fs = 1.0 / (dt_median * time_scale)
+
+    return fs, x_values * time_scale
+
+
+def load_tsv_waveform(file_path):
+    """Load TSV/TXT/CSV waveform data, preferring columns D(time) and E(signal)."""
+    path = Path(file_path)
+    delimiter = "," if path.suffix.lower() == ".csv" else "\t"
+
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as file:
+        for line in file:
+            parts = line.rstrip("\n").split(delimiter)
+            if len(parts) >= 5:
+                rows.append((parts[3], parts[4]))
+            elif len(parts) >= 2:
+                rows.append((parts[0], parts[1]))
+
+    points = []
+    skipped = 0
+    for x_raw, y_raw in rows:
+        x_value = to_float(x_raw)
+        y_value = to_float(y_raw)
+        if x_value is None or y_value is None:
+            skipped += 1
+            continue
+        points.append((x_value, y_value))
+
+    if len(points) < 20:
+        raise ValueError(f"{path.name}: not enough numeric waveform points.")
+
+    points.sort(key=lambda point: point[0])
+    x_values = np.array([point[0] for point in points], dtype=float)
+    y_values = np.array([point[1] for point in points], dtype=float)
+    fs, t_seconds = infer_sampling_rate_from_time(x_values)
+
+    return t_seconds, y_values, fs, skipped
+
+
+def iter_tsv_waveform_chunks(file_path, chunk_rows=600000):
+    """Yield numeric time/signal chunks from TSV/TXT/CSV files."""
+    path = Path(file_path)
+    delimiter = "," if path.suffix.lower() == ".csv" else "\t"
+
+    reader = pd.read_csv(
+        path,
+        sep=delimiter,
+        header=None,
+        skiprows=7,
+        usecols=[3, 4],
+        chunksize=int(chunk_rows),
+        engine="c",
+        on_bad_lines="skip",
+    )
+
+    for chunk in reader:
+        x_values = pd.to_numeric(
+            chunk.iloc[:, 0].astype(str).str.strip().str.replace(
+                r"[^0-9eE+\-\.]",
+                "",
+                regex=True,
+            ),
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        y_values = pd.to_numeric(
+            chunk.iloc[:, 1].astype(str).str.strip().str.replace(
+                r"[^0-9eE+\-\.]",
+                "",
+                regex=True,
+            ),
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        valid = np.isfinite(x_values) & np.isfinite(y_values)
+        if not np.any(valid):
+            continue
+
+        x_values = x_values[valid]
+        y_values = y_values[valid]
+        fs, t_seconds = infer_sampling_rate_from_time(x_values)
+        yield t_seconds, y_values, fs, int(np.sum(~valid))
+
+
+def _butter_bandpass_sos(fs, low, high, order=4):
+    nyquist = 0.5 * fs
+    low = max(1e-6, low / nyquist)
+    high = min(0.999999, high / nyquist)
+    return butter(order, [low, high], btype="band", output="sos")
+
+
+def _apply_notch(signal, fs, line_hz=50.0, q=35.0):
+    w0 = line_hz / (fs / 2.0)
+    if not (0 < w0 < 1):
+        return signal
+
+    b, a = iirnotch(w0, q)
+    padlen = min(len(signal) - 1, 3 * max(len(a), len(b)))
+    return filtfilt(b, a, signal, padtype="odd", padlen=padlen)
+
+
+def _moving_mad_stats(values, fs, win_s=10.0):
+    med_value = float(np.median(values))
+    dev_value = float(median_abs_deviation(values, scale="normal")) + 1e-9
+    return np.full_like(values, med_value), np.full_like(values, dev_value)
+
+
+def _band_power_fft(values, fs, bands):
+    n = len(values)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    power = (np.abs(np.fft.rfft(values)) ** 2) / max(1, n)
+    return [
+        float(np.sum(power[(freqs >= low) & (freqs < high)]))
+        for low, high in bands
+    ]
+
+
+def _eeg_preprocess(signal, fs):
+    width = max(3, int(round(fs * 2.0)))
+    if width % 2 == 0:
+        width += 1
+    baseline = median_filter(signal, size=width, mode="nearest")
+    processed = signal - baseline
+    processed = _apply_notch(processed, fs, 50.0, q=30.0)
+    processed = _apply_notch(processed, fs, 100.0, q=30.0)
+    return sosfiltfilt(
+        _butter_bandpass_sos(fs, 0.5, min(100.0, 0.45 * fs), order=4),
+        processed,
+    )
+
+
+def _decimate_to(signal, fs, target_fs):
+    if target_fs >= fs:
+        return signal, fs
+
+    cutoff = 0.45 * target_fs
+    filtered = sosfilt(butter(6, cutoff, btype="low", fs=fs, output="sos"), signal)
+    down = max(1, int(round(fs / target_fs)))
+    return resample_poly(filtered, 1, down), fs / down
+
+
+def detect_epileptiform_spikes(signal, fs):
+    """Detect sharp epileptiform spikes using EEG/ECG analyser spike criteria."""
+    signal = np.asarray(signal, dtype=float)
+    signal = _eeg_preprocess(signal, fs)
+    signal, fs = _decimate_to(signal, fs, 500)
+
+    sos = _butter_bandpass_sos(fs, 14.0, min(70.0, 0.45 * fs), order=4)
+    hf = sosfiltfilt(sos, signal)
+    hf_abs = np.abs(hf)
+    med, dev = _moving_mad_stats(hf_abs, fs, 10.0)
+    z_values = (hf_abs - med) / dev
+
+    min_dist = max(1, int(fs * 50 / 1000.0))
+    peaks, _ = find_peaks(z_values, height=4.8, distance=min_dist)
+
+    grad_med = np.median(np.abs(np.diff(signal))) + 1e-9
+    curv_med = np.median(np.abs(np.diff(signal, n=2))) + 1e-9
+    events = []
+    n = len(signal)
+
+    for peak in peaks:
+        half = 0.5 * hf_abs[peak]
+        left = right = int(peak)
+        while left > 0 and hf_abs[left] > half:
+            left -= 1
+        while right < n - 1 and hf_abs[right] > half:
+            right += 1
+
+        width_ms = 1000.0 * max(1, right - left) / fs
+        if not (8 <= width_ms <= 100):
+            continue
+
+        k = max(2, int(round(0.005 * fs)))
+        core_left = max(0, peak - k)
+        core_right = min(n, peak + k)
+        core = signal[core_left:core_right]
+        peak_slope = float(np.max(np.abs(np.diff(core)))) if core.size >= 2 else 0.0
+
+        pre_span = max(k * 5, int(0.02 * fs))
+        base_left = max(0, core_left - pre_span)
+        base = signal[base_left:core_left]
+        base_grad = float(np.median(np.abs(np.diff(base)))) + 1e-9 if base.size >= 2 else grad_med
+        if peak_slope < 1.4 * base_grad:
+            continue
+
+        sharp = float(np.max(np.abs(np.diff(core, n=2)))) if core.size >= 3 else 0.0
+        if sharp < 1.2 * curv_med:
+            continue
+
+        seg_start = max(0, peak - int(0.04 * fs))
+        seg_end = min(n, peak + int(0.04 * fs))
+        segment = signal[seg_start:seg_end]
+        if segment.size >= int(0.02 * fs):
+            high_power, low_power = _band_power_fft(segment, fs, [(30, 80), (1, 20)])
+            if low_power <= 0 or (high_power / low_power) < 0.05:
+                continue
+
+        amp_window = int(round(3.0 * fs))
+        amp_start = max(0, peak - amp_window // 2)
+        amp_end = min(n, peak + amp_window // 2)
+        seg_abs = np.abs(signal[amp_start:amp_end])
+        med_abs = float(np.median(seg_abs))
+        mad_abs = float(median_abs_deviation(seg_abs, scale="normal")) + 1e-9
+        z_amp = (abs(float(signal[peak])) - med_abs) / mad_abs
+        if z_amp < 7.0:
+            continue
+
+        events.append(
+            {
+                "idx": int(peak),
+                "time_s": float(peak / fs),
+                "width_ms": float(width_ms),
+                "z_amp": float(z_amp),
+                "confidence": float(1.0 / (1.0 + np.exp(-(z_amp - 7.0)))),
+            }
+        )
+
+    return events
+
+
+def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progress_callback=None):
+    """Detect, align, overlay, and average spikes from multiple TSV/TXT/CSV files."""
+    aligned_spikes = []
+    event_rows = []
+    file_rows = []
+    target_dt = None
+    eeg_module = load_eeg_ecg_analyser_module()
+
+    total_files = len(file_paths)
+    for file_index, file_path in enumerate(file_paths, start=1):
+        path = Path(file_path)
+        if progress_callback:
+            progress_callback(
+                f"EEG/ECG detection first: file {file_index}/{total_files} {path.name}",
+            )
+
+        def eeg_progress(percent, message):
+            if progress_callback:
+                progress_callback(f"{path.name}: {message} ({float(percent):.1f}%)")
+
+        _, events_df, meta = eeg_module.analyze_eeg_file(
+            str(path),
+            progress_callback=eeg_progress,
+            streaming_threshold_mb=128.0,
+        )
+        spike_times = _active_spike_times_from_eeg_events(eeg_module, events_df)
+        total_detected = int(len(spike_times))
+        spike_times = np.sort(spike_times)
+        next_spike = 0
+        used_count = 0
+        skipped_total = 0
+        pre_s = pre_ms / 1000.0
+        post_s = post_ms / 1000.0
+
+        if progress_callback:
+            progress_callback(
+                f"{path.name}: EEG/ECG detector found {total_detected} active spikes. Extracting waveforms.",
+            )
+
+        for chunk_index, (time_s, signal, fs, skipped) in enumerate(iter_tsv_waveform_chunks(path), start=1):
+            if progress_callback:
+                progress_callback(
+                    "Extracting spike windows "
+                    f"file {file_index}/{total_files}, chunk {chunk_index}, "
+                    f"time {float(time_s[0]):.1f}-{float(time_s[-1]):.1f}s, "
+                    f"used {len(aligned_spikes)} spikes",
+                )
+
+            skipped_total += skipped
+            pre_samples = int(round(pre_ms / 1000.0 * fs))
+            post_samples = int(round(post_ms / 1000.0 * fs))
+            local_x = (np.arange(-pre_samples, post_samples + 1) / fs) * 1000.0
+
+            if target_dt is None:
+                target_dt = 1000.0 / fs
+                average_x = local_x
+
+            while next_spike < len(spike_times) and spike_times[next_spike] < float(time_s[0]) - pre_s:
+                next_spike += 1
+
+            scan_index = next_spike
+            while scan_index < len(spike_times):
+                spike_time = float(spike_times[scan_index])
+                if spike_time > float(time_s[-1]) + post_s:
+                    break
+                if not (float(time_s[0]) + pre_s <= spike_time <= float(time_s[-1]) - post_s):
+                    scan_index += 1
+                    continue
+
+                idx = int(np.searchsorted(time_s, spike_time))
+                start = idx - pre_samples
+                end = idx + post_samples + 1
+                if start < 0 or end > len(signal):
+                    scan_index += 1
+                    continue
+
+                segment = signal[start:end].astype(float)
+                baseline_count = max(3, min(pre_samples, int(round(0.02 * fs))))
+                baseline = float(np.median(segment[:baseline_count]))
+                segment = segment - baseline
+
+                if not np.isclose(target_dt, 1000.0 / fs):
+                    segment = np.interp(average_x, local_x, segment)
+
+                aligned_spikes.append(
+                    {
+                        "file": str(path),
+                        "spike_number": len(aligned_spikes) + 1,
+                        "event": {"time_s": spike_time},
+                        "x_ms": average_x.copy(),
+                        "y": segment,
+                    }
+                )
+                event_rows.append(
+                    {
+                        "File": str(path),
+                        "Spike": len(aligned_spikes),
+                        "Peak time (s)": spike_time,
+                        "Detector": "EEG/ECG analyser",
+                        "Saved corrections applied": int(meta.get("eeg_saved_corrections_applied", 0) or 0),
+                    }
+                )
+                used_count += 1
+                scan_index += 1
+
+            if progress_callback:
+                progress_callback(
+                    "Chunk complete "
+                    f"file {file_index}/{total_files}, chunk {chunk_index}: "
+                    f"{total_detected} detected, {used_count} used from this file, "
+                    f"{len(aligned_spikes)} total",
+                )
+
+            if next_spike >= len(spike_times):
+                break
+
+        file_rows.append(
+            {
+                "File": str(path),
+                "Rows skipped": int(skipped_total),
+                "Detected spikes": int(total_detected),
+                "Spikes used": int(used_count),
+                "EEG saved corrections applied": int(meta.get("eeg_saved_corrections_applied", 0) or 0),
+                "EEG detection profile": str(meta.get("eeg_detection_profile", "")),
+                "Streaming": bool(meta.get("streaming", False)),
+            }
+        )
+
+        if progress_callback:
+            progress_callback(
+                f"Finished {path.name}: {total_detected} detected, {used_count} used.",
+            )
+
+    if not aligned_spikes:
+        raise ValueError("No complete spikes were detected in the selected TSV files.")
+
+    y_stack = np.vstack([spike["y"] for spike in aligned_spikes])
+    average_y = np.mean(y_stack, axis=0)
+
+    return {
+        "x_ms": average_x,
+        "spikes": aligned_spikes,
+        "average_y": average_y,
+        "event_rows": event_rows,
+        "file_rows": file_rows,
+        "pre_ms": float(pre_ms),
+        "post_ms": float(post_ms),
+    }
+
+
+def export_average_spikes_to_excel(output_path, average_result):
+    """Export every aligned spike plus average spike x,y data."""
+    workbook = Workbook()
+    all_sheet = workbook.active
+    all_sheet.title = "All Spikes"
+    all_sheet.append(["Spike", "Source file", "x_ms", "y"])
+
+    for spike in average_result["spikes"]:
+        for x_value, y_value in zip(spike["x_ms"], spike["y"]):
+            all_sheet.append(
+                [spike["spike_number"], spike["file"], float(x_value), float(y_value)]
+            )
+        all_sheet.append([])
+
+    average_sheet = workbook.create_sheet("Average Spike")
+    average_sheet.append(["x_ms", "average_y"])
+    for x_value, y_value in zip(average_result["x_ms"], average_result["average_y"]):
+        average_sheet.append([float(x_value), float(y_value)])
+
+    events_sheet = workbook.create_sheet("Detected Spikes")
+    if average_result["event_rows"]:
+        headers = list(average_result["event_rows"][0].keys())
+        events_sheet.append(headers)
+        for row in average_result["event_rows"]:
+            events_sheet.append([row.get(header, "") for header in headers])
+
+    files_sheet = workbook.create_sheet("Files")
+    headers = list(average_result["file_rows"][0].keys())
+    files_sheet.append(headers)
+    for row in average_result["file_rows"]:
+        files_sheet.append([row.get(header, "") for header in headers])
+
+    for worksheet in workbook.worksheets:
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(wrap_text=True)
+        for row in worksheet.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+        worksheet.freeze_panes = "A2"
+        autosize_worksheet_columns(worksheet)
+
+    workbook.save(output_path)
+    return output_path
+
+
+def save_average_spike_plot(output_path, average_result):
+    """Save overlay plot of all detected spikes and their average."""
+    figure, axis = plt.subplots(figsize=(10, 6), dpi=150)
+    for spike in average_result["spikes"]:
+        axis.plot(spike["x_ms"], spike["y"], color="#1f77b4", alpha=0.18, linewidth=1)
+
+    axis.plot(
+        average_result["x_ms"],
+        average_result["average_y"],
+        color="#d7191c",
+        linewidth=3,
+        label="Average spike",
+    )
+    axis.axvline(0, color="#111111", linestyle=":", linewidth=1, label="Aligned peak")
+    axis.set_title("Detected epileptiform spikes overlay")
+    axis.set_xlabel("Time from detected peak (ms)")
+    axis.set_ylabel("Baseline-corrected signal")
+    axis.grid(True)
+    axis.legend()
+    figure.tight_layout()
+    figure.savefig(output_path)
+    plt.close(figure)
+    return output_path
+
+
+def load_eeg_ecg_analyser_module():
+    """Load EEG/ECG analyser so spike detection matches that program."""
+    if not EEG_ECG_ANALYSER_PATH.exists():
+        raise FileNotFoundError(
+            "EEG/ECG analyser source was not found at "
+            f"{EEG_ECG_ANALYSER_PATH}"
+        )
+
+    spec = importlib.util.spec_from_file_location(
+        "eeg_ecg_analyser_shared",
+        EEG_ECG_ANALYSER_PATH,
+    )
+    module = importlib.util.module_from_spec(spec)
+    previous_bootstrap = os.environ.get("EEG_ECG_ANALYSER_BOOTSTRAPPED")
+    os.environ["EEG_ECG_ANALYSER_BOOTSTRAPPED"] = "1"
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous_bootstrap is None:
+            os.environ.pop("EEG_ECG_ANALYSER_BOOTSTRAPPED", None)
+        else:
+            os.environ["EEG_ECG_ANALYSER_BOOTSTRAPPED"] = previous_bootstrap
+    return module
+
+
+def _active_spike_times_from_eeg_events(eeg_module, events_df):
+    if hasattr(eeg_module, "active_eeg_events"):
+        active = eeg_module.active_eeg_events(events_df)
+    else:
+        active = events_df.copy()
+        if "Is_Deleted" in active.columns:
+            active = active.loc[~active["Is_Deleted"].astype(bool)]
+
+    if len(active) == 0 or "Type" not in active.columns:
+        return np.array([], dtype=float)
+
+    spike_rows = active.loc[active["Type"].astype(str) == "Spike"]
+    if "Start_s" not in spike_rows.columns:
+        return np.array([], dtype=float)
+
+    return spike_rows["Start_s"].to_numpy(dtype=float)
+
+
 def format_number(value, digits=10):
     """Format numbers for readable equations without unnecessary trailing zeros."""
     text = f"{value:.{digits}g}"
@@ -264,7 +896,13 @@ def autosize_worksheet_columns(worksheet):
         worksheet.column_dimensions[column_letter].width = min(max_length + 2, 90)
 
 
-def export_analysis_to_excel(output_path, metadata_rows, area_rows, formula_rows):
+def export_analysis_to_excel(
+    output_path,
+    metadata_rows,
+    area_rows,
+    formula_rows,
+    spike_metric_rows=None,
+):
     """Export area results and formulas to an Excel workbook."""
     workbook = Workbook()
 
@@ -292,6 +930,14 @@ def export_analysis_to_excel(output_path, metadata_rows, area_rows, formula_rows
     else:
         formulas_sheet.append(["Formula"])
         formulas_sheet.append(["No formula rows were generated."])
+
+    if spike_metric_rows:
+        spike_sheet = workbook.create_sheet("Spike Metrics")
+        headers = list(spike_metric_rows[0].keys())
+        spike_sheet.append(headers)
+
+        for row in spike_metric_rows:
+            spike_sheet.append([row.get(header, "") for header in headers])
 
     for worksheet in workbook.worksheets:
         for cell in worksheet[1]:
@@ -368,6 +1014,31 @@ def print_spline_summary(x_values, output_path, signed_area, absolute_area):
     print("Important:")
     print("This is exact at the Excel points, but it is a piecewise formula.")
     print("There is one cubic equation between each pair of x values.")
+
+
+def print_spike_summary(spike_metrics):
+    """Print dominant spike morphology metrics."""
+    print()
+    print("Dominant spike metrics:")
+    print(f"Baseline y: {spike_metrics['Baseline y (median)']:.6f}")
+    print(f"Polarity: {spike_metrics['Spike polarity']}")
+    print(f"Peak x: {spike_metrics['Peak x']:.6f}")
+    print(f"Peak y: {spike_metrics['Peak y']:.6f}")
+    print(
+        "Peak amplitude from baseline: "
+        f"{spike_metrics['Peak amplitude (absolute from baseline)']:.6f}"
+    )
+
+    rise_time = spike_metrics["Rise time (10-90%)"]
+    decay_time = spike_metrics["Decay time (90-10%)"]
+    print(
+        "Rise time (10-90%): "
+        f"{rise_time:.6f}" if rise_time is not None else "Rise time (10-90%): not found"
+    )
+    print(
+        "Decay time (90-10%): "
+        f"{decay_time:.6f}" if decay_time is not None else "Decay time (90-10%): not found"
+    )
 
 
 def to_float(value):
@@ -554,7 +1225,7 @@ def plot_fit(
     plt.xlabel("x")
     plt.ylabel("y")
     plt.title(title)
-    plt.text(
+    note = plt.text(
         0.02,
         0.98,
         equation_text,
@@ -562,7 +1233,9 @@ def plot_fit(
         verticalalignment="top",
         bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "gray"},
     )
-    plt.legend()
+    note.set_picker(True)
+    legend = plt.legend()
+    legend.set_draggable(True)
     plt.grid(True)
     plt.show()
 
@@ -605,7 +1278,7 @@ def plot_exact_spline(
     plt.xlabel("x")
     plt.ylabel("y")
     plt.title(title)
-    plt.text(
+    note = plt.text(
         0.02,
         0.98,
         label_text,
@@ -613,7 +1286,9 @@ def plot_exact_spline(
         verticalalignment="top",
         bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "gray"},
     )
-    plt.legend()
+    note.set_picker(True)
+    legend = plt.legend()
+    legend.set_draggable(True)
     plt.grid(True)
     plt.show()
 
@@ -673,6 +1348,9 @@ def main():
     if mode is None:
         mode = choose_analysis_mode(default_mode="exact")
 
+    spike_metrics = calculate_spike_metrics(x_data, y_data)
+    spike_metric_rows = build_spike_metric_rows(spike_metrics)
+
     if mode == "sinusoid":
         A, B, C, D = fit_sinusoidal(x_data, y_data)
         x_min = float(np.min(x_data))
@@ -709,7 +1387,9 @@ def main():
                 ("Absolute area under curve", absolute_area),
             ],
             formula_rows=build_sinusoid_formula_rows(A, B, C, D),
+            spike_metric_rows=spike_metric_rows,
         )
+        print_spike_summary(spike_metrics)
         print(f"Excel results saved to: {results_path}")
 
         plot_fit(
@@ -760,8 +1440,10 @@ def main():
                 ("Absolute area under curve", absolute_area),
             ],
             formula_rows=build_spline_formula_rows(x_data, spline),
+            spike_metric_rows=spike_metric_rows,
         )
         print_spline_summary(x_data, formula_path, signed_area, absolute_area)
+        print_spike_summary(spike_metrics)
         print(f"Excel results saved to: {results_path}")
         plot_exact_spline(
             x_data,

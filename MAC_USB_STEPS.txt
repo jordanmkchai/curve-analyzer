@@ -1,0 +1,46 @@
+Curve Analyzer Mac Instructions
+===============================
+
+Choose the correct zip
+----------------------
+
+Use this file for M1, M2, M3, or M4 Macs:
+
+Curve_Analyzer_macOS_apple-silicon_v1.0.0.zip
+
+Use this file for older Intel Macs:
+
+Curve_Analyzer_macOS_intel_v1.0.0.zip
+
+How to run on the Mac
+---------------------
+
+1. Copy the correct zip file from the USB drive to the Mac.
+2. Double-click the zip file to unzip it.
+3. Open the unzipped folder.
+4. Double-click "Curve Analyzer.app".
+
+If macOS blocks the app
+-----------------------
+
+Because this app is not Apple-notarized, macOS may block it the first time.
+
+If that happens:
+
+1. Right-click "Curve Analyzer.app".
+2. Click "Open".
+3. Click "Open" again.
+
+After that, the app should open normally.
+
+Which Mac type do I have?
+-------------------------
+
+On the Mac:
+
+1. Click the Apple menu in the top-left corner.
+2. Click "About This Mac".
+3. Look for "Chip" or "Processor".
+
+If it says Apple M1, M2, M3, or M4, use the apple-silicon zip.
+If it says Intel, use the intel zip.

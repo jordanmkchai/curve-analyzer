@@ -1,0 +1,28 @@
+Curve Analyzer Windows Instructions
+===================================
+
+How to run on Windows
+---------------------
+
+Option 1: Use the zip file
+
+1. Copy Curve_Analyzer_Portable_v1.0.0.zip to the Windows computer.
+2. Right-click the zip file and choose "Extract All".
+3. Open the extracted folder.
+4. Double-click "Curve Analyzer.exe".
+
+Option 2: Use the already extracted folder
+
+1. Open Curve_Analyzer_Portable_v1.0.0.
+2. Double-click "Curve Analyzer.exe".
+
+If Windows blocks the app
+-------------------------
+
+This can happen because the app is not code-signed.
+
+If it is your personal computer, click:
+
+More info -> Run anyway
+
+If it is a work computer, ask IT to approve or whitelist the app.
