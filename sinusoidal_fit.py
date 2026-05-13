@@ -545,6 +545,25 @@ def detect_epileptiform_spikes(signal, fs):
     return events
 
 
+def _find_alignment_extremum(signal, event_index, fs, search_ms=60.0):
+    """Find local dominant peak/trough near detector event."""
+    radius = max(1, int(round(search_ms / 1000.0 * fs)))
+    left = max(0, int(event_index) - radius)
+    right = min(len(signal), int(event_index) + radius + 1)
+    window = signal[left:right]
+
+    if len(window) == 0:
+        return int(event_index), 0.0, "unknown"
+
+    baseline = float(np.median(window))
+    relative = window - baseline
+    local_index = int(np.argmax(np.abs(relative)))
+    align_index = left + local_index
+    amplitude = float(relative[local_index])
+    polarity = "positive peak" if amplitude >= 0 else "negative trough"
+    return align_index, amplitude, polarity
+
+
 def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progress_callback=None):
     """Detect, align, overlay, and average spikes from multiple TSV/TXT/CSV files."""
     aligned_spikes = []
@@ -614,7 +633,13 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
                     scan_index += 1
                     continue
 
-                idx = int(np.searchsorted(time_s, spike_time))
+                detector_idx = int(np.searchsorted(time_s, spike_time))
+                idx, align_amplitude, align_polarity = _find_alignment_extremum(
+                    signal,
+                    detector_idx,
+                    fs,
+                )
+                align_time = float(time_s[idx])
                 start = idx - pre_samples
                 end = idx + post_samples + 1
                 if start < 0 or end > len(signal):
@@ -633,16 +658,24 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
                     {
                         "file": str(path),
                         "spike_number": len(aligned_spikes) + 1,
-                        "event": {"time_s": spike_time},
+                        "event": {"detector_time_s": spike_time, "align_time_s": align_time},
                         "x_ms": average_x.copy(),
                         "y": segment,
+                        "raw_y": segment.copy(),
+                        "alignment_amplitude": align_amplitude,
+                        "alignment_polarity": align_polarity,
+                        "polarity_flipped": False,
                     }
                 )
                 event_rows.append(
                     {
                         "File": str(path),
                         "Spike": len(aligned_spikes),
-                        "Peak time (s)": spike_time,
+                        "Detector time (s)": spike_time,
+                        "Aligned peak/trough time (s)": align_time,
+                        "Alignment shift (ms)": (align_time - spike_time) * 1000.0,
+                        "Alignment amplitude": align_amplitude,
+                        "Alignment polarity": align_polarity,
                         "Detector": "EEG/ECG analyser",
                         "Saved corrections applied": int(meta.get("eeg_saved_corrections_applied", 0) or 0),
                     }
@@ -681,6 +714,23 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
     if not aligned_spikes:
         raise ValueError("No complete spikes were detected in the selected TSV files.")
 
+    positive_count = sum(1 for spike in aligned_spikes if spike["alignment_amplitude"] >= 0)
+    negative_count = len(aligned_spikes) - positive_count
+    dominant_sign = 1.0 if positive_count >= negative_count else -1.0
+    dominant_polarity = "positive peak" if dominant_sign > 0 else "negative trough"
+
+    for spike in aligned_spikes:
+        spike_sign = 1.0 if spike["alignment_amplitude"] >= 0 else -1.0
+        if spike_sign != dominant_sign:
+            spike["y"] = -spike["y"]
+            spike["polarity_flipped"] = True
+
+    for row in event_rows:
+        spike_index = int(row["Spike"]) - 1
+        if 0 <= spike_index < len(aligned_spikes):
+            row["Dominant average polarity"] = dominant_polarity
+            row["Polarity flipped for average"] = aligned_spikes[spike_index]["polarity_flipped"]
+
     y_stack = np.vstack([spike["y"] for spike in aligned_spikes])
     average_y = np.mean(y_stack, axis=0)
 
@@ -692,6 +742,10 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
         "file_rows": file_rows,
         "pre_ms": float(pre_ms),
         "post_ms": float(post_ms),
+        "alignment": "local dominant peak/trough within +/-60 ms of EEG/ECG detector event",
+        "dominant_polarity": dominant_polarity,
+        "positive_alignment_count": int(positive_count),
+        "negative_alignment_count": int(negative_count),
     }
 
 
@@ -700,12 +754,30 @@ def export_average_spikes_to_excel(output_path, average_result):
     workbook = Workbook()
     all_sheet = workbook.active
     all_sheet.title = "All Spikes"
-    all_sheet.append(["Spike", "Source file", "x_ms", "y"])
+    all_sheet.append(
+        [
+            "Spike",
+            "Source file",
+            "x_ms",
+            "y",
+            "original_y",
+            "Alignment polarity",
+            "Polarity flipped for average",
+        ]
+    )
 
     for spike in average_result["spikes"]:
-        for x_value, y_value in zip(spike["x_ms"], spike["y"]):
+        for x_value, y_value, raw_y_value in zip(spike["x_ms"], spike["y"], spike["raw_y"]):
             all_sheet.append(
-                [spike["spike_number"], spike["file"], float(x_value), float(y_value)]
+                [
+                    spike["spike_number"],
+                    spike["file"],
+                    float(x_value),
+                    float(y_value),
+                    float(raw_y_value),
+                    spike["alignment_polarity"],
+                    bool(spike["polarity_flipped"]),
+                ]
             )
         all_sheet.append([])
 
@@ -754,10 +826,10 @@ def save_average_spike_plot(output_path, average_result):
         linewidth=3,
         label="Average spike",
     )
-    axis.axvline(0, color="#111111", linestyle=":", linewidth=1, label="Aligned peak")
-    axis.set_title("Detected epileptiform spikes overlay")
-    axis.set_xlabel("Time from detected peak (ms)")
-    axis.set_ylabel("Baseline-corrected signal")
+    axis.axvline(0, color="#111111", linestyle=":", linewidth=1, label="Aligned peak/trough")
+    axis.set_title("Peak/trough-aligned epileptiform spikes overlay")
+    axis.set_xlabel("Time from aligned peak/trough (ms)")
+    axis.set_ylabel("Baseline-corrected signal (polarity-normalized)")
     axis.grid(True)
     axis.legend()
     figure.tight_layout()
@@ -902,8 +974,9 @@ def export_analysis_to_excel(
     area_rows,
     formula_rows,
     spike_metric_rows=None,
+    data_rows=None,
 ):
-    """Export area results and formulas to an Excel workbook."""
+    """Export area results, formulas, spike metrics, and optional x/y data."""
     workbook = Workbook()
 
     area_sheet = workbook.active
@@ -939,6 +1012,14 @@ def export_analysis_to_excel(
         for row in spike_metric_rows:
             spike_sheet.append([row.get(header, "") for header in headers])
 
+    if data_rows:
+        data_sheet = workbook.create_sheet("Data")
+        headers = list(data_rows[0].keys())
+        data_sheet.append(headers)
+
+        for row in data_rows:
+            data_sheet.append([row.get(header, "") for header in headers])
+
     for worksheet in workbook.worksheets:
         for cell in worksheet[1]:
             cell.font = Font(bold=True)
@@ -953,6 +1034,208 @@ def export_analysis_to_excel(
 
     workbook.save(output_path)
     return output_path
+
+
+def build_data_rows(x_values, y_values):
+    """Build x/y data rows for analysis workbook reloads."""
+    return [
+        {
+            "x": float(x_value),
+            "y": float(y_value),
+        }
+        for x_value, y_value in zip(x_values, y_values)
+    ]
+
+
+def _sheet_to_key_values(workbook, sheet_name):
+    if sheet_name not in workbook.sheetnames:
+        return []
+
+    rows = []
+    worksheet = workbook[sheet_name]
+    in_area = False
+    for row in worksheet.iter_rows(values_only=True):
+        if not row or row[0] in (None, ""):
+            continue
+        if row[0] == "Area Result":
+            in_area = True
+            continue
+        if in_area:
+            continue
+        key = str(row[0])
+        if key in {"Field", "Value", "Area Result", "Metric"}:
+            continue
+        rows.append((key, row[1] if len(row) > 1 else ""))
+
+    return rows
+
+
+def _read_table_rows(workbook, sheet_name):
+    if sheet_name not in workbook.sheetnames:
+        return []
+
+    worksheet = workbook[sheet_name]
+    iterator = worksheet.iter_rows(values_only=True)
+    try:
+        headers = next(iterator)
+    except StopIteration:
+        return []
+
+    headers = [str(header) if header is not None else "" for header in headers]
+    rows = []
+    for values in iterator:
+        if not values or all(value in (None, "") for value in values):
+            continue
+        rows.append(
+            {
+                header: values[index] if index < len(values) else None
+                for index, header in enumerate(headers)
+                if header
+            }
+        )
+
+    return rows
+
+
+def _rows_to_xy(rows, x_key, y_key):
+    x_values = []
+    y_values = []
+    for row in rows:
+        x_value = to_float(row.get(x_key))
+        y_value = to_float(row.get(y_key))
+        if x_value is None or y_value is None:
+            continue
+        x_values.append(x_value)
+        y_values.append(y_value)
+
+    if len(x_values) < 4:
+        return None, None
+
+    return np.array(x_values, dtype=float), np.array(y_values, dtype=float)
+
+
+def load_previous_analysis_workbook(file_path):
+    """Load a previous Curve Analyzer workbook for viewing."""
+    workbook = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        metadata_rows = _sheet_to_key_values(workbook, "Area Results")
+        area_rows = []
+        if "Area Results" in workbook.sheetnames:
+            area_sheet = workbook["Area Results"]
+            in_area = False
+            for row in area_sheet.iter_rows(values_only=True):
+                if not row or row[0] in (None, ""):
+                    continue
+                if row[0] == "Area Result":
+                    in_area = True
+                    continue
+                if in_area and row[0] != "Value":
+                    area_rows.append((str(row[0]), row[1] if len(row) > 1 else ""))
+
+        spike_metric_rows = _read_table_rows(workbook, "Spike Metrics")
+        formula_rows = _read_table_rows(workbook, "Formulas")
+        source_file = Path(file_path)
+
+        if "Average Spike" in workbook.sheetnames:
+            average_rows = _read_table_rows(workbook, "Average Spike")
+            x_values, y_values = _rows_to_xy(average_rows, "x_ms", "average_y")
+            if x_values is None:
+                raise ValueError("Average Spike sheet does not contain usable x_ms/average_y data.")
+
+            overlay_rows = _read_table_rows(workbook, "All Spikes")
+            overlay_spikes = []
+            grouped = {}
+            for row in overlay_rows:
+                spike_number = row.get("Spike")
+                x_value = to_float(row.get("x_ms"))
+                y_value = to_float(row.get("y"))
+                if spike_number is None or x_value is None or y_value is None:
+                    continue
+                grouped.setdefault(spike_number, {"x": [], "y": []})
+                grouped[spike_number]["x"].append(x_value)
+                grouped[spike_number]["y"].append(y_value)
+
+            for spike_number, values in grouped.items():
+                if len(values["x"]) >= 4:
+                    overlay_spikes.append(
+                        {
+                            "spike_number": spike_number,
+                            "x_ms": np.array(values["x"], dtype=float),
+                            "y": np.array(values["y"], dtype=float),
+                        }
+                    )
+
+            x_values, y_values, spline = make_exact_spline(x_values, y_values)
+            signed_area, absolute_area = calculate_spline_area(spline, x_values[0], x_values[-1])
+            spike_metrics = calculate_spike_metrics(x_values, y_values)
+            return {
+                "mode": "previous_average_spike",
+                "source_file": source_file,
+                "sheet_name": "Average Spike",
+                "x": x_values,
+                "y": y_values,
+                "spline": spline,
+                "signed_area": signed_area,
+                "absolute_area": absolute_area,
+                "metadata_rows": metadata_rows,
+                "area_rows": area_rows or [
+                    ("x start", float(x_values[0])),
+                    ("x end", float(x_values[-1])),
+                    ("Signed area under curve", signed_area),
+                    ("Absolute area under curve", absolute_area),
+                ],
+                "formula_rows": formula_rows,
+                "spike_metrics": spike_metrics,
+                "spike_metric_rows": spike_metric_rows or build_spike_metric_rows(spike_metrics),
+                "overlay_spikes": overlay_spikes,
+                "data_rows": build_data_rows(x_values, y_values),
+            }
+
+        if "Data" in workbook.sheetnames:
+            data_rows = _read_table_rows(workbook, "Data")
+            x_values, y_values = _rows_to_xy(data_rows, "x", "y")
+            if x_values is None:
+                raise ValueError("Data sheet does not contain usable x/y data.")
+
+            x_values, y_values, spline = make_exact_spline(x_values, y_values)
+            signed_area, absolute_area = calculate_spline_area(spline, x_values[0], x_values[-1])
+            spike_metrics = calculate_spike_metrics(x_values, y_values)
+            return {
+                "mode": "previous_data",
+                "source_file": source_file,
+                "sheet_name": "Data",
+                "x": x_values,
+                "y": y_values,
+                "spline": spline,
+                "signed_area": signed_area,
+                "absolute_area": absolute_area,
+                "metadata_rows": metadata_rows,
+                "area_rows": area_rows or [
+                    ("x start", float(x_values[0])),
+                    ("x end", float(x_values[-1])),
+                    ("Signed area under curve", signed_area),
+                    ("Absolute area under curve", absolute_area),
+                ],
+                "formula_rows": formula_rows,
+                "spike_metrics": spike_metrics,
+                "spike_metric_rows": spike_metric_rows or build_spike_metric_rows(spike_metrics),
+                "data_rows": build_data_rows(x_values, y_values),
+            }
+
+        if metadata_rows or area_rows or spike_metric_rows or formula_rows:
+            return {
+                "mode": "previous_summary",
+                "source_file": source_file,
+                "sheet_name": "Workbook Summary",
+                "metadata_rows": metadata_rows,
+                "area_rows": area_rows,
+                "formula_rows": formula_rows,
+                "spike_metric_rows": spike_metric_rows,
+            }
+
+        raise ValueError("This workbook does not look like a Curve Analyzer result workbook.")
+    finally:
+        workbook.close()
 
 
 def save_spline_equations(
@@ -1388,6 +1671,7 @@ def main():
             ],
             formula_rows=build_sinusoid_formula_rows(A, B, C, D),
             spike_metric_rows=spike_metric_rows,
+            data_rows=build_data_rows(x_data, y_data),
         )
         print_spike_summary(spike_metrics)
         print(f"Excel results saved to: {results_path}")
@@ -1441,6 +1725,7 @@ def main():
             ],
             formula_rows=build_spline_formula_rows(x_data, spline),
             spike_metric_rows=spike_metric_rows,
+            data_rows=build_data_rows(x_data, y_data),
         )
         print_spline_summary(x_data, formula_path, signed_area, absolute_area)
         print_spike_summary(spike_metrics)

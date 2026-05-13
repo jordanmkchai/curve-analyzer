@@ -27,6 +27,7 @@ from sinusoidal_fit import (
     export_analysis_to_excel,
     fit_sinusoidal,
     format_sinusoid_equation,
+    load_previous_analysis_workbook,
     load_xy_from_excel,
     make_exact_spline,
     save_average_spike_plot,
@@ -137,6 +138,13 @@ class CurveAnalyzerApp:
         )
         self.average_tsv_button.grid(row=0, column=3, padx=(8, 0))
 
+        self.open_previous_button = ttk.Button(
+            action_frame,
+            text="Open Previous Analysis",
+            command=self.open_previous_analysis,
+        )
+        self.open_previous_button.grid(row=0, column=4, padx=(8, 0))
+
         content = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
         content.grid(row=3, column=0, sticky="nsew")
 
@@ -212,6 +220,7 @@ class CurveAnalyzerApp:
                 result["area_rows"],
                 result["formula_rows"],
                 result["spike_metric_rows"],
+                result["data_rows"],
             )
 
             result["output_path"] = output_path
@@ -274,6 +283,10 @@ class CurveAnalyzerApp:
                 "formula_rows": build_sinusoid_formula_rows(A, B, C, D),
                 "spike_metrics": spike_metrics,
                 "spike_metric_rows": spike_metric_rows,
+                "data_rows": [
+                    {"x": float(x_value), "y": float(y_value)}
+                    for x_value, y_value in zip(x_data, y_data)
+                ],
             }
 
         x_data, y_data, spline = make_exact_spline(x_data, y_data)
@@ -312,7 +325,45 @@ class CurveAnalyzerApp:
             "formula_rows": build_spline_formula_rows(x_data, spline),
             "spike_metrics": spike_metrics,
             "spike_metric_rows": spike_metric_rows,
+            "data_rows": [
+                {"x": float(x_value), "y": float(y_value)}
+                for x_value, y_value in zip(x_data, y_data)
+            ],
         }
+
+    def open_previous_analysis(self):
+        file_path = filedialog.askopenfilename(
+            title="Open previous Curve Analyzer workbook",
+            filetypes=[
+                ("Excel workbooks", "*.xlsx *.xlsm"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not file_path:
+            return
+
+        self._set_busy(True)
+        try:
+            result = load_previous_analysis_workbook(file_path)
+            result["output_path"] = Path(file_path)
+            self.last_result = result
+            self._write_summary(result)
+            if "x" in result and "y" in result:
+                self._draw_result(result)
+                self.export_button.configure(state=tk.NORMAL)
+            else:
+                self._draw_empty_plot()
+                self.export_button.configure(state=tk.DISABLED)
+            self.output_path_var.set(f"Loaded previous analysis: {file_path}")
+            self.status_var.set("Previous analysis loaded.")
+            self.open_folder_button.configure(state=tk.NORMAL)
+        except Exception as error:
+            traceback.print_exc()
+            messagebox.showerror("Open previous analysis failed", str(error))
+            self.status_var.set("Open previous analysis failed.")
+        finally:
+            self._set_busy(False)
 
     def average_tsv_spikes(self):
         file_paths = filedialog.askopenfilenames(
@@ -390,6 +441,10 @@ class CurveAnalyzerApp:
             ("Files analysed", len(average_result["file_rows"])),
             ("Pre-peak window (ms)", average_result["pre_ms"]),
             ("Post-peak window (ms)", average_result["post_ms"]),
+            ("Spike alignment", average_result.get("alignment", "")),
+            ("Dominant average polarity", average_result.get("dominant_polarity", "")),
+            ("Positive aligned spikes", average_result.get("positive_alignment_count", "")),
+            ("Negative aligned spikes", average_result.get("negative_alignment_count", "")),
             (
                 "Formula type",
                 "Piecewise cubic spline: y = a*(x-x0)^3 + b*(x-x0)^2 + c*(x-x0) + d",
@@ -416,6 +471,10 @@ class CurveAnalyzerApp:
             "formula_rows": build_spline_formula_rows(x_data, spline),
             "spike_metrics": spike_metrics,
             "spike_metric_rows": spike_metric_rows,
+            "data_rows": [
+                {"x": float(x_value), "y": float(y_value)}
+                for x_value, y_value in zip(x_data, y_data)
+            ],
         }
 
     def export_as(self):
@@ -442,6 +501,7 @@ class CurveAnalyzerApp:
                 self.last_result["area_rows"],
                 self.last_result["formula_rows"],
                 self.last_result["spike_metric_rows"],
+                self.last_result.get("data_rows"),
             )
             self.last_result["output_path"] = Path(output_path)
             self.output_path_var.set(f"Results exported to: {output_path}")
@@ -468,30 +528,51 @@ class CurveAnalyzerApp:
             f"Worksheet: {result['sheet_name']}",
             "",
             f"Mode: {self._mode_label(result)}",
-            f"x start: {result['area_rows'][0][1]:.6f}",
-            f"x end:   {result['area_rows'][1][1]:.6f}",
-            "",
-            f"Signed area:   {result['signed_area']:.6f}",
-            f"Absolute area: {result['absolute_area']:.6f}",
-            "",
-            "Spike metrics:",
-            f"Baseline y: {result['spike_metrics']['Baseline y (median)']:.6f}",
-            f"Polarity: {result['spike_metrics']['Spike polarity']}",
-            f"Peak x: {result['spike_metrics']['Peak x']:.6f}",
-            f"Peak y: {result['spike_metrics']['Peak y']:.6f}",
-            (
-                "Peak amplitude: "
-                f"{result['spike_metrics']['Peak amplitude (absolute from baseline)']:.6f}"
-            ),
-            self._format_optional_metric(
-                "Rise time (10-90%)",
-                result["spike_metrics"]["Rise time (10-90%)"],
-            ),
-            self._format_optional_metric(
-                "Decay time (90-10%)",
-                result["spike_metrics"]["Decay time (90-10%)"],
-            ),
         ]
+
+        if "signed_area" in result and "absolute_area" in result:
+            lines.extend(
+                [
+                    f"x start: {self._format_number(result['area_rows'][0][1])}",
+                    f"x end:   {self._format_number(result['area_rows'][1][1])}",
+                    "",
+                    f"Signed area:   {result['signed_area']:.6f}",
+                    f"Absolute area: {result['absolute_area']:.6f}",
+                ]
+            )
+        elif result.get("area_rows"):
+            lines.extend(["", "Area results:"])
+            for key, value in result["area_rows"]:
+                lines.append(f"{key}: {value}")
+
+        if result.get("spike_metrics"):
+            lines.extend(
+                [
+                    "",
+                    "Spike metrics:",
+                    f"Baseline y: {result['spike_metrics']['Baseline y (median)']:.6f}",
+                    f"Polarity: {result['spike_metrics']['Spike polarity']}",
+                    f"Peak x: {result['spike_metrics']['Peak x']:.6f}",
+                    f"Peak y: {result['spike_metrics']['Peak y']:.6f}",
+                    (
+                        "Peak amplitude: "
+                        f"{result['spike_metrics']['Peak amplitude (absolute from baseline)']:.6f}"
+                    ),
+                    self._format_optional_metric(
+                        "Rise time (10-90%)",
+                        result["spike_metrics"]["Rise time (10-90%)"],
+                    ),
+                    self._format_optional_metric(
+                        "Decay time (90-10%)",
+                        result["spike_metrics"]["Decay time (90-10%)"],
+                    ),
+                ]
+            )
+
+        if result.get("metadata_rows"):
+            lines.extend(["", "Workbook metadata:"])
+            for key, value in result["metadata_rows"]:
+                lines.append(f"{key}: {value}")
 
         if result["mode"] == "sinusoid":
             A, B, C, D = result["parameters"]
@@ -511,8 +592,7 @@ class CurveAnalyzerApp:
             lines.extend(
                 [
                     "",
-                    f"Piecewise formulas: {len(result['formula_rows'])}",
-                    "The formulas are saved on the Formulas sheet.",
+                    f"Formula rows: {len(result.get('formula_rows', []))}",
                 ]
             )
 
@@ -526,12 +606,24 @@ class CurveAnalyzerApp:
             return "Exact cubic spline interpolation"
         if result["mode"] == "sinusoid":
             return "Sinusoidal best fit"
+        if result["mode"] == "previous_average_spike":
+            return "Previous average spike analysis"
+        if result["mode"] == "previous_data":
+            return "Previous analysis with saved x/y data"
+        if result["mode"] == "previous_summary":
+            return "Previous workbook summary"
         return "Average TSV epileptiform spike"
 
     def _format_optional_metric(self, label, value):
         if value is None:
             return f"{label}: not found"
         return f"{label}: {value:.6f}"
+
+    def _format_number(self, value):
+        try:
+            return f"{float(value):.6f}"
+        except (TypeError, ValueError):
+            return str(value)
 
     def _draw_empty_plot(self):
         self.axis.clear()
@@ -569,7 +661,7 @@ class CurveAnalyzerApp:
             x_fit = np.linspace(np.min(x_data), np.max(x_data), 2000)
             y_fit = spline(x_fit)
             line_label = "Exact interpolated curve"
-            if result["mode"] == "average_spike":
+            if result["mode"] in {"average_spike", "previous_average_spike"}:
                 line_label = "Average spike curve"
                 title = f"Average Epileptiform Spike: {result['source_file'].name}"
             else:
@@ -580,7 +672,21 @@ class CurveAnalyzerApp:
                 f"Absolute area = {result['absolute_area']:.4f}"
             )
 
-        scatter_label = "Average spike data" if result["mode"] == "average_spike" else "Original data"
+        for spike in result.get("overlay_spikes", []):
+            self.axis.plot(
+                spike["x_ms"],
+                spike["y"],
+                color="#1f77b4",
+                alpha=0.14,
+                linewidth=1,
+                zorder=1,
+            )
+
+        scatter_label = (
+            "Average spike data"
+            if result["mode"] in {"average_spike", "previous_average_spike"}
+            else "Original data"
+        )
         self.axis.scatter(x_data, y_data, label=scatter_label, color="#1f5cff", s=28)
         self.axis.plot(x_fit, y_fit, label=line_label, color="#d7191c", linewidth=2)
         self.axis.scatter(
