@@ -1,6 +1,7 @@
 import sys
 import os
 import importlib.util
+import re
 from pathlib import Path
 
 import numpy as np
@@ -564,142 +565,259 @@ def _find_alignment_extremum(signal, event_index, fs, search_ms=60.0):
     return align_index, amplitude, polarity
 
 
+def _read_declared_sample_count(file_path):
+    """Read Axion-style Count header from large text exports."""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+            for _ in range(20):
+                line = file.readline()
+                if not line:
+                    break
+                parts = [part.strip() for part in line.rstrip("\n").split("\t")]
+                if not parts:
+                    continue
+                key = parts[0].strip().rstrip(":").lower()
+                if key != "count" or len(parts) < 2:
+                    continue
+                return int(float(parts[1]))
+    except Exception:
+        return None
+    return None
+
+
+def _progress_percent_from_eeg_message(message, total_samples):
+    if not total_samples:
+        return None
+
+    match = re.search(r"scanned\s+([\d,]+)", str(message))
+    if not match:
+        return None
+
+    try:
+        processed = int(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+    return 5.0 + 85.0 * min(1.0, processed / max(1, int(total_samples)))
+
+
+def _read_spike_window(eeg_module, path, start_s, end_s, fs_hint):
+    if not hasattr(eeg_module, "read_waveform_window"):
+        raise RuntimeError("EEG/ECG analyser read_waveform_window() is unavailable.")
+
+    time_s, signal = eeg_module.read_waveform_window(
+        str(path),
+        float(start_s),
+        float(end_s),
+        fs_hint=fs_hint,
+    )
+    time_s = np.asarray(time_s, dtype=float)
+    signal = np.asarray(signal, dtype=float)
+    valid = np.isfinite(time_s) & np.isfinite(signal)
+    if not np.any(valid):
+        return None, None, None
+
+    time_s = time_s[valid]
+    signal = signal[valid]
+    order = np.argsort(time_s)
+    time_s = time_s[order]
+    signal = signal[order]
+    unique_time, unique_index = np.unique(time_s, return_index=True)
+    signal = signal[unique_index]
+    time_s = unique_time
+    if len(time_s) < 5:
+        return None, None, None
+
+    if fs_hint is not None and np.isfinite(float(fs_hint)) and float(fs_hint) > 0:
+        fs = float(fs_hint)
+    else:
+        fs, time_s = infer_sampling_rate_from_time(time_s)
+
+    return time_s, signal, fs
+
+
+def _extract_aligned_spike_segment(
+    eeg_module,
+    path,
+    spike_time,
+    pre_ms,
+    post_ms,
+    target_x_ms=None,
+    fs_hint=None,
+    align_search_ms=60.0,
+):
+    pre_s = float(pre_ms) / 1000.0
+    post_s = float(post_ms) / 1000.0
+    search_s = float(align_search_ms) / 1000.0
+    window_start = float(spike_time) - pre_s - search_s
+    window_end = float(spike_time) + post_s + search_s
+    time_s, signal, fs = _read_spike_window(eeg_module, path, window_start, window_end, fs_hint)
+    if time_s is None:
+        return None
+
+    detector_idx = int(np.searchsorted(time_s, float(spike_time)))
+    detector_idx = max(0, min(detector_idx, len(time_s) - 1))
+    align_idx, align_amplitude, align_polarity = _find_alignment_extremum(
+        signal,
+        detector_idx,
+        fs,
+        search_ms=align_search_ms,
+    )
+    align_time = float(time_s[align_idx])
+
+    if target_x_ms is None:
+        pre_samples = int(round(pre_ms / 1000.0 * fs))
+        post_samples = int(round(post_ms / 1000.0 * fs))
+        target_x_ms = (np.arange(-pre_samples, post_samples + 1) / fs) * 1000.0
+    else:
+        target_x_ms = np.asarray(target_x_ms, dtype=float)
+
+    local_x_ms = (time_s - align_time) * 1000.0
+    if local_x_ms[0] > target_x_ms[0] or local_x_ms[-1] < target_x_ms[-1]:
+        return None
+
+    segment = np.interp(target_x_ms, local_x_ms, signal).astype(float)
+    baseline_points = max(
+        3,
+        int(np.sum(target_x_ms <= target_x_ms[0] + min(20.0, float(pre_ms)))),
+    )
+    baseline = float(np.median(segment[:baseline_points]))
+    segment = segment - baseline
+
+    return {
+        "x_ms": target_x_ms,
+        "y": segment,
+        "detector_time_s": float(spike_time),
+        "align_time_s": align_time,
+        "alignment_amplitude": float(align_amplitude),
+        "alignment_polarity": align_polarity,
+        "fs": float(fs),
+    }
+
+
 def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progress_callback=None):
     """Detect, align, overlay, and average spikes from multiple TSV/TXT/CSV files."""
     aligned_spikes = []
     event_rows = []
     file_rows = []
-    target_dt = None
+    average_x = None
     eeg_module = load_eeg_ecg_analyser_module()
 
     total_files = len(file_paths)
     for file_index, file_path in enumerate(file_paths, start=1):
         path = Path(file_path)
+        declared_samples = _read_declared_sample_count(path)
+        last_eeg_progress = {"message": ""}
         if progress_callback:
             progress_callback(
                 f"EEG/ECG detection first: file {file_index}/{total_files} {path.name}",
             )
 
         def eeg_progress(percent, message):
+            adjusted_percent = _progress_percent_from_eeg_message(message, declared_samples)
+            percent_value = adjusted_percent if adjusted_percent is not None else float(percent)
+            formatted = f"{path.name}: {message} ({percent_value:.1f}%)"
+            last_eeg_progress["message"] = formatted
             if progress_callback:
-                progress_callback(f"{path.name}: {message} ({float(percent):.1f}%)")
+                progress_callback(formatted)
 
-        _, events_df, meta = eeg_module.analyze_eeg_file(
-            str(path),
-            progress_callback=eeg_progress,
-            streaming_threshold_mb=128.0,
-        )
+        try:
+            _, events_df, meta = eeg_module.analyze_eeg_file(
+                str(path),
+                progress_callback=eeg_progress,
+                streaming_threshold_mb=128.0,
+            )
+        except Exception as exc:
+            detail = last_eeg_progress["message"] or "no progress reported"
+            raise RuntimeError(
+                f"{path.name}: EEG/ECG spike detection failed after {detail}. {exc}"
+            ) from exc
+
         spike_times = _active_spike_times_from_eeg_events(eeg_module, events_df)
         total_detected = int(len(spike_times))
         spike_times = np.sort(spike_times)
-        next_spike = 0
         used_count = 0
-        skipped_total = 0
-        pre_s = pre_ms / 1000.0
-        post_s = post_ms / 1000.0
+        skipped_windows = 0
+        fs_hint = meta.get("fs_Hz")
+        try:
+            fs_hint = float(fs_hint)
+        except (TypeError, ValueError):
+            fs_hint = None
 
         if progress_callback:
             progress_callback(
-                f"{path.name}: EEG/ECG detector found {total_detected} active spikes. Extracting waveforms.",
+                f"{path.name}: EEG/ECG detector found {total_detected} active spikes. Extracting aligned waveforms.",
             )
 
-        for chunk_index, (time_s, signal, fs, skipped) in enumerate(iter_tsv_waveform_chunks(path), start=1):
-            if progress_callback:
+        progress_step = max(1, total_detected // 20) if total_detected else 1
+        for spike_index, spike_time in enumerate(spike_times, start=1):
+            if progress_callback and (spike_index == 1 or spike_index % progress_step == 0):
                 progress_callback(
                     "Extracting spike windows "
-                    f"file {file_index}/{total_files}, chunk {chunk_index}, "
-                    f"time {float(time_s[0]):.1f}-{float(time_s[-1]):.1f}s, "
-                    f"used {len(aligned_spikes)} spikes",
+                    f"file {file_index}/{total_files}, spike {spike_index}/{total_detected}, "
+                    f"used {used_count} from this file, {len(aligned_spikes)} total",
                 )
 
-            skipped_total += skipped
-            pre_samples = int(round(pre_ms / 1000.0 * fs))
-            post_samples = int(round(post_ms / 1000.0 * fs))
-            local_x = (np.arange(-pre_samples, post_samples + 1) / fs) * 1000.0
-
-            if target_dt is None:
-                target_dt = 1000.0 / fs
-                average_x = local_x
-
-            while next_spike < len(spike_times) and spike_times[next_spike] < float(time_s[0]) - pre_s:
-                next_spike += 1
-
-            scan_index = next_spike
-            while scan_index < len(spike_times):
-                spike_time = float(spike_times[scan_index])
-                if spike_time > float(time_s[-1]) + post_s:
-                    break
-                if not (float(time_s[0]) + pre_s <= spike_time <= float(time_s[-1]) - post_s):
-                    scan_index += 1
-                    continue
-
-                detector_idx = int(np.searchsorted(time_s, spike_time))
-                idx, align_amplitude, align_polarity = _find_alignment_extremum(
-                    signal,
-                    detector_idx,
-                    fs,
+            try:
+                extracted = _extract_aligned_spike_segment(
+                    eeg_module,
+                    path,
+                    float(spike_time),
+                    pre_ms,
+                    post_ms,
+                    target_x_ms=average_x,
+                    fs_hint=fs_hint,
                 )
-                align_time = float(time_s[idx])
-                start = idx - pre_samples
-                end = idx + post_samples + 1
-                if start < 0 or end > len(signal):
-                    scan_index += 1
-                    continue
+            except Exception:
+                extracted = None
 
-                segment = signal[start:end].astype(float)
-                baseline_count = max(3, min(pre_samples, int(round(0.02 * fs))))
-                baseline = float(np.median(segment[:baseline_count]))
-                segment = segment - baseline
+            if extracted is None:
+                skipped_windows += 1
+                continue
 
-                if not np.isclose(target_dt, 1000.0 / fs):
-                    segment = np.interp(average_x, local_x, segment)
+            if average_x is None:
+                average_x = extracted["x_ms"].copy()
 
-                aligned_spikes.append(
-                    {
-                        "file": str(path),
-                        "spike_number": len(aligned_spikes) + 1,
-                        "event": {"detector_time_s": spike_time, "align_time_s": align_time},
-                        "x_ms": average_x.copy(),
-                        "y": segment,
-                        "raw_y": segment.copy(),
-                        "alignment_amplitude": align_amplitude,
-                        "alignment_polarity": align_polarity,
-                        "polarity_flipped": False,
-                    }
-                )
-                event_rows.append(
-                    {
-                        "File": str(path),
-                        "Spike": len(aligned_spikes),
-                        "Detector time (s)": spike_time,
-                        "Aligned peak/trough time (s)": align_time,
-                        "Alignment shift (ms)": (align_time - spike_time) * 1000.0,
-                        "Alignment amplitude": align_amplitude,
-                        "Alignment polarity": align_polarity,
-                        "Detector": "EEG/ECG analyser",
-                        "Saved corrections applied": int(meta.get("eeg_saved_corrections_applied", 0) or 0),
-                    }
-                )
-                used_count += 1
-                scan_index += 1
+            segment = extracted["y"]
+            align_time = extracted["align_time_s"]
+            align_amplitude = extracted["alignment_amplitude"]
+            align_polarity = extracted["alignment_polarity"]
 
-            if progress_callback:
-                progress_callback(
-                    "Chunk complete "
-                    f"file {file_index}/{total_files}, chunk {chunk_index}: "
-                    f"{total_detected} detected, {used_count} used from this file, "
-                    f"{len(aligned_spikes)} total",
-                )
-
-            if next_spike >= len(spike_times):
-                break
+            aligned_spikes.append(
+                {
+                    "file": str(path),
+                    "spike_number": len(aligned_spikes) + 1,
+                    "event": {"detector_time_s": float(spike_time), "align_time_s": align_time},
+                    "x_ms": average_x.copy(),
+                    "y": segment,
+                    "raw_y": segment.copy(),
+                    "alignment_amplitude": align_amplitude,
+                    "alignment_polarity": align_polarity,
+                    "polarity_flipped": False,
+                }
+            )
+            event_rows.append(
+                {
+                    "File": str(path),
+                    "Spike": len(aligned_spikes),
+                    "Detector time (s)": float(spike_time),
+                    "Aligned peak/trough time (s)": align_time,
+                    "Alignment shift (ms)": (align_time - float(spike_time)) * 1000.0,
+                    "Alignment amplitude": align_amplitude,
+                    "Alignment polarity": align_polarity,
+                    "Detector": "EEG/ECG analyser",
+                    "Saved corrections applied": int(meta.get("eeg_saved_corrections_applied", 0) or 0),
+                }
+            )
+            used_count += 1
 
         file_rows.append(
             {
                 "File": str(path),
-                "Rows skipped": int(skipped_total),
+                "Rows skipped": 0,
                 "Detected spikes": int(total_detected),
                 "Spikes used": int(used_count),
+                "Waveform windows skipped": int(skipped_windows),
                 "EEG saved corrections applied": int(meta.get("eeg_saved_corrections_applied", 0) or 0),
                 "EEG detection profile": str(meta.get("eeg_detection_profile", "")),
                 "Streaming": bool(meta.get("streaming", False)),
@@ -708,7 +826,7 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
 
         if progress_callback:
             progress_callback(
-                f"Finished {path.name}: {total_detected} detected, {used_count} used.",
+                f"Finished {path.name}: {total_detected} detected, {used_count} used, {skipped_windows} skipped.",
             )
 
     if not aligned_spikes:
@@ -792,9 +910,23 @@ def export_average_spikes_to_excel(output_path, average_result):
         events_sheet.append(headers)
         for row in average_result["event_rows"]:
             events_sheet.append([row.get(header, "") for header in headers])
+    else:
+        events_sheet.append(["No detected spikes exported"])
 
     files_sheet = workbook.create_sheet("Files")
-    headers = list(average_result["file_rows"][0].keys())
+    if average_result["file_rows"]:
+        headers = list(average_result["file_rows"][0].keys())
+    else:
+        headers = [
+            "File",
+            "Rows skipped",
+            "Detected spikes",
+            "Spikes used",
+            "Waveform windows skipped",
+            "EEG saved corrections applied",
+            "EEG detection profile",
+            "Streaming",
+        ]
     files_sheet.append(headers)
     for row in average_result["file_rows"]:
         files_sheet.append([row.get(header, "") for header in headers])
