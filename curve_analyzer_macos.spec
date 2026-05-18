@@ -10,6 +10,7 @@ hiddenimports += collect_submodules("openpyxl")
 hiddenimports += collect_submodules("scipy.interpolate")
 hiddenimports += collect_submodules("scipy.optimize")
 hiddenimports += [
+    "eeg_ecg_analyser_shared",
     "matplotlib.backends.backend_tkagg",
     "PIL._tkinter_finder",
 ]

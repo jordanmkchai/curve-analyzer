@@ -1,6 +1,4 @@
 import sys
-import os
-import importlib.util
 import re
 from pathlib import Path
 
@@ -15,10 +13,6 @@ from scipy.optimize import curve_fit
 from scipy.signal import butter, find_peaks, iirnotch, sosfiltfilt, filtfilt, sosfilt, resample_poly
 from scipy.ndimage import median_filter
 from scipy.stats import median_abs_deviation
-
-
-EEG_ECG_ANALYSER_PATH = Path(r"D:\eeg_ecg_analyser\eeg_ecg analyser 2.py")
-
 
 def sinusoid(x, A, B, C, D):
     """Sinusoidal model: y = A * sin(B*x + C) + D."""
@@ -987,27 +981,11 @@ def save_average_spike_plot(output_path, average_result):
 
 
 def load_eeg_ecg_analyser_module():
-    """Load EEG/ECG analyser so spike detection matches that program."""
-    if not EEG_ECG_ANALYSER_PATH.exists():
-        raise FileNotFoundError(
-            "EEG/ECG analyser source was not found at "
-            f"{EEG_ECG_ANALYSER_PATH}"
-        )
-
-    spec = importlib.util.spec_from_file_location(
-        "eeg_ecg_analyser_shared",
-        EEG_ECG_ANALYSER_PATH,
-    )
-    module = importlib.util.module_from_spec(spec)
-    previous_bootstrap = os.environ.get("EEG_ECG_ANALYSER_BOOTSTRAPPED")
-    os.environ["EEG_ECG_ANALYSER_BOOTSTRAPPED"] = "1"
+    """Load the bundled EEG/ECG helper used by average-spike analysis."""
     try:
-        spec.loader.exec_module(module)
-    finally:
-        if previous_bootstrap is None:
-            os.environ.pop("EEG_ECG_ANALYSER_BOOTSTRAPPED", None)
-        else:
-            os.environ["EEG_ECG_ANALYSER_BOOTSTRAPPED"] = previous_bootstrap
+        import eeg_ecg_analyser_shared as module
+    except Exception as exc:
+        raise RuntimeError("Bundled EEG/ECG analyser helper could not be loaded.") from exc
     return module
 
 
