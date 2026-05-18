@@ -31,6 +31,7 @@ from sinusoidal_fit import (
     load_xy_from_excel,
     make_exact_spline,
     save_average_spike_plots,
+    select_average_spike_groups,
     sinusoid,
 )
 
@@ -47,6 +48,9 @@ class CurveAnalyzerApp:
         self.status_var = tk.StringVar(value="Select an Excel file to begin.")
         self.output_path_var = tk.StringVar(value="No results exported yet.")
         self.last_result = None
+        self.last_average_result = None
+        self.average_group_order = []
+        self.current_average_group_key = None
         self.note_artist = None
         self.metric_text_artists = []
         self._drag_artist = None
@@ -138,12 +142,20 @@ class CurveAnalyzerApp:
         )
         self.average_tsv_button.grid(row=0, column=3, padx=(8, 0))
 
+        self.toggle_average_group_button = ttk.Button(
+            action_frame,
+            text="Toggle Spike Group",
+            command=self.toggle_average_spike_group,
+            state=tk.DISABLED,
+        )
+        self.toggle_average_group_button.grid(row=0, column=4, padx=(8, 0))
+
         self.open_previous_button = ttk.Button(
             action_frame,
             text="Open Previous Analysis",
             command=self.open_previous_analysis,
         )
-        self.open_previous_button.grid(row=0, column=4, padx=(8, 0))
+        self.open_previous_button.grid(row=0, column=5, padx=(8, 0))
 
         content = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
         content.grid(row=3, column=0, sticky="nsew")
@@ -225,6 +237,7 @@ class CurveAnalyzerApp:
 
             result["output_path"] = output_path
             self.last_result = result
+            self._clear_average_spike_state()
 
             self._write_summary(result)
             self._draw_result(result)
@@ -348,6 +361,7 @@ class CurveAnalyzerApp:
             result = load_previous_analysis_workbook(file_path)
             result["output_path"] = Path(file_path)
             self.last_result = result
+            self._clear_average_spike_state()
             self._write_summary(result)
             if "x" in result and "y" in result:
                 self._draw_result(result)
@@ -384,6 +398,14 @@ class CurveAnalyzerApp:
                 file_paths,
                 progress_callback=self._set_average_progress,
             )
+            selected_group_keys = self._choose_average_spike_groups(average_result)
+            if selected_group_keys is None:
+                self.status_var.set("Average spikes cancelled.")
+                return
+            average_result = select_average_spike_groups(
+                average_result,
+                selected_group_keys,
+            )
             first_file = Path(file_paths[0])
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_excel = first_file.with_name(f"average_epileptiform_spikes_{stamp}.xlsx")
@@ -395,12 +417,17 @@ class CurveAnalyzerApp:
             result = self._build_average_spike_analysis_result(
                 output_excel,
                 average_result,
+                average_result["primary_group_key"],
             )
             result["output_path"] = output_excel
+            self.last_average_result = average_result
+            self.average_group_order = list(average_result["average_groups"])
+            self.current_average_group_key = average_result["primary_group_key"]
             self.last_result = result
 
             self._write_summary(result)
             self._draw_result(result)
+            self._update_average_group_toggle_state()
             graph_lines = "\n".join(
                 f"{average_result['average_groups'][key]['label'].title()} graph: {path}"
                 for key, path in output_plots.items()
@@ -422,6 +449,67 @@ class CurveAnalyzerApp:
         finally:
             self._set_busy(False)
 
+    def _choose_average_spike_groups(self, average_result):
+        groups = average_result["average_groups"]
+        if len(groups) <= 1:
+            return list(groups)
+
+        result = {"keys": None}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Choose Spike Groups")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+
+        ttk.Label(
+            frame,
+            text="Choose which detected spike groups to run:",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        variables = {}
+        for row_index, (group_key, group) in enumerate(groups.items(), start=1):
+            variable = tk.BooleanVar(value=True)
+            variables[group_key] = variable
+            ttk.Checkbutton(
+                frame,
+                text=f"{group['label'].title()} ({group['spike_count']} spikes)",
+                variable=variable,
+            ).grid(row=row_index, column=0, sticky="w", pady=3)
+
+        button_row = len(groups) + 1
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=button_row, column=0, sticky="e", pady=(14, 0))
+
+        def confirm():
+            selected = [key for key, variable in variables.items() if variable.get()]
+            if not selected:
+                messagebox.showwarning(
+                    "Choose a group",
+                    "Select at least one detected spike group.",
+                    parent=dialog,
+                )
+                return
+            result["keys"] = selected
+            dialog.destroy()
+
+        def cancel():
+            result["keys"] = None
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=cancel).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Continue", command=confirm).grid(row=0, column=1)
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - dialog.winfo_width()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - dialog.winfo_height()) // 2)
+        dialog.geometry(f"+{x}+{y}")
+        self.root.wait_window(dialog)
+        return result["keys"]
+
     def _set_average_progress(self, message):
         self.status_var.set(message)
         self.summary_text.configure(state=tk.NORMAL)
@@ -430,22 +518,22 @@ class CurveAnalyzerApp:
         self.summary_text.configure(state=tk.DISABLED)
         self.root.update_idletasks()
 
-    def _build_average_spike_analysis_result(self, source_file, average_result):
-        primary_group = average_result["average_groups"][average_result["primary_group_key"]]
-        x_data, y_data, spline = make_exact_spline(
-            primary_group["x_ms"],
-            primary_group["average_y"],
-        )
-        signed_area, absolute_area = calculate_spline_area(spline, x_data[0], x_data[-1])
-        spike_metrics = calculate_spike_metrics(x_data, y_data)
+    def _build_average_spike_analysis_result(self, source_file, average_result, group_key):
+        selected_group = average_result["average_groups"][group_key]
+        x_data = selected_group["x_ms"]
+        y_data = selected_group["average_y"]
+        spline = selected_group["spline"]
+        signed_area = selected_group["signed_area"]
+        absolute_area = selected_group["absolute_area"]
+        spike_metrics = selected_group["spike_metrics"]
         spike_metric_rows = build_spike_metric_rows(spike_metrics)
 
         metadata_rows = [
             ("Source file", str(source_file)),
-            ("Worksheet", primary_group["sheet_name"]),
+            ("Worksheet", selected_group["sheet_name"]),
             ("Analysis mode", "Average TSV epileptiform spikes by polarity"),
-            ("Displayed average group", primary_group["label"]),
-            ("Spikes averaged in displayed group", primary_group["spike_count"]),
+            ("Displayed average group", selected_group["label"]),
+            ("Spikes averaged in displayed group", selected_group["spike_count"]),
             ("Spikes analysed total", len(average_result["spikes"])),
             ("Files analysed", len(average_result["file_rows"])),
             ("Pre-peak window (ms)", average_result["pre_ms"]),
@@ -453,6 +541,7 @@ class CurveAnalyzerApp:
             ("Spike alignment", average_result.get("alignment", "")),
             ("Positive aligned spikes", average_result.get("positive_alignment_count", "")),
             ("Negative aligned spikes", average_result.get("negative_alignment_count", "")),
+            ("Selected average groups", ", ".join(average_result.get("selected_group_labels", []))),
             (
                 "Formula type",
                 "Piecewise cubic spline: y = a*(x-x0)^3 + b*(x-x0)^2 + c*(x-x0) + d",
@@ -468,8 +557,8 @@ class CurveAnalyzerApp:
         return {
             "mode": "average_spike",
             "source_file": Path(source_file),
-            "sheet_name": primary_group["sheet_name"],
-            "displayed_group_label": primary_group["label"],
+            "sheet_name": selected_group["sheet_name"],
+            "displayed_group_label": selected_group["label"],
             "x": x_data,
             "y": y_data,
             "spline": spline,
@@ -480,12 +569,60 @@ class CurveAnalyzerApp:
             "formula_rows": build_spline_formula_rows(x_data, spline),
             "spike_metrics": spike_metrics,
             "spike_metric_rows": spike_metric_rows,
-            "overlay_spikes": primary_group["spikes"],
+            "overlay_spikes": selected_group["spikes"],
             "data_rows": [
                 {"x": float(x_value), "y": float(y_value)}
                 for x_value, y_value in zip(x_data, y_data)
             ],
         }
+
+    def toggle_average_spike_group(self):
+        if not self.last_average_result or len(self.average_group_order) <= 1:
+            return
+
+        current_index = self.average_group_order.index(self.current_average_group_key)
+        next_index = (current_index + 1) % len(self.average_group_order)
+        self.current_average_group_key = self.average_group_order[next_index]
+        source_file = self.last_result["source_file"]
+        output_path = self.last_result.get("output_path")
+        result = self._build_average_spike_analysis_result(
+            source_file,
+            self.last_average_result,
+            self.current_average_group_key,
+        )
+        if output_path:
+            result["output_path"] = output_path
+        self.last_result = result
+        self._write_summary(result)
+        self._draw_result(result)
+        self._update_average_group_toggle_state()
+
+    def _update_average_group_toggle_state(self):
+        if not self.last_average_result or len(self.average_group_order) <= 1:
+            self.toggle_average_group_button.configure(
+                text="Toggle Spike Group",
+                state=tk.DISABLED,
+            )
+            return
+
+        current_index = self.average_group_order.index(self.current_average_group_key)
+        next_index = (current_index + 1) % len(self.average_group_order)
+        next_group = self.last_average_result["average_groups"][
+            self.average_group_order[next_index]
+        ]
+        self.toggle_average_group_button.configure(
+            text=f"Show {next_group['label'].title()}",
+            state=tk.NORMAL,
+        )
+
+    def _clear_average_spike_state(self):
+        self.last_average_result = None
+        self.average_group_order = []
+        self.current_average_group_key = None
+        self.toggle_average_group_button.configure(
+            text="Toggle Spike Group",
+            state=tk.DISABLED,
+        )
 
     def export_as(self):
         if not self.last_result:

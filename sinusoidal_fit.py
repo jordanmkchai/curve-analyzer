@@ -843,6 +843,44 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
     if not aligned_spikes:
         raise ValueError("No complete spikes were detected in the selected TSV files.")
 
+    for spike in aligned_spikes:
+        spike_x, spike_y, spike_spline = make_exact_spline(spike["x_ms"], spike["y"])
+        signed_area, absolute_area = calculate_spline_area(
+            spike_spline,
+            spike_x[0],
+            spike_x[-1],
+        )
+        spike["x_ms"] = spike_x
+        spike["y"] = spike_y
+        spike["signed_area"] = signed_area
+        spike["absolute_area"] = absolute_area
+        spike["spike_metrics"] = calculate_spike_metrics(spike_x, spike_y)
+
+    spike_by_number = {
+        spike["spike_number"]: spike
+        for spike in aligned_spikes
+    }
+    for row in event_rows:
+        spike = spike_by_number.get(row.get("Spike"))
+        if not spike:
+            continue
+        metrics = spike["spike_metrics"]
+        row.update(
+            {
+                "Signed area under curve": spike["signed_area"],
+                "Absolute area under curve": spike["absolute_area"],
+                "Baseline y (median)": metrics["Baseline y (median)"],
+                "Spike polarity": metrics["Spike polarity"],
+                "Peak x": metrics["Peak x"],
+                "Peak y": metrics["Peak y"],
+                "Peak amplitude (absolute from baseline)": metrics[
+                    "Peak amplitude (absolute from baseline)"
+                ],
+                "Rise time (10-90%)": metrics["Rise time (10-90%)"],
+                "Decay time (90-10%)": metrics["Decay time (90-10%)"],
+            }
+        )
+
     average_groups = {}
     for group_key, group_label, sheet_name in [
         ("positive_peak", "positive peak", "Positive Average Spike"),
@@ -855,14 +893,27 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
         if not group_spikes:
             continue
         y_stack = np.vstack([spike["y"] for spike in group_spikes])
+        group_x, group_y, group_spline = make_exact_spline(
+            average_x.copy(),
+            np.mean(y_stack, axis=0),
+        )
+        signed_area, absolute_area = calculate_spline_area(
+            group_spline,
+            group_x[0],
+            group_x[-1],
+        )
         average_groups[group_key] = {
             "key": group_key,
             "label": group_label,
             "sheet_name": sheet_name,
-            "x_ms": average_x.copy(),
-            "average_y": np.mean(y_stack, axis=0),
+            "x_ms": group_x,
+            "average_y": group_y,
             "spikes": group_spikes,
             "spike_count": len(group_spikes),
+            "spline": group_spline,
+            "signed_area": signed_area,
+            "absolute_area": absolute_area,
+            "spike_metrics": calculate_spike_metrics(group_x, group_y),
         }
 
     positive_count = len(average_groups.get("positive_peak", {}).get("spikes", []))
@@ -919,9 +970,40 @@ def export_average_spikes_to_excel(output_path, average_result):
         all_sheet.append([])
 
     summary_sheet = workbook.create_sheet("Average Groups")
-    summary_sheet.append(["Average group", "Spikes averaged", "Worksheet"])
+    summary_sheet.append(
+        [
+            "Average group",
+            "Spikes averaged",
+            "Worksheet",
+            "Signed area under curve",
+            "Absolute area under curve",
+            "Baseline y (median)",
+            "Spike polarity",
+            "Peak x",
+            "Peak y",
+            "Peak amplitude (absolute from baseline)",
+            "Rise time (10-90%)",
+            "Decay time (90-10%)",
+        ]
+    )
     for group in average_result["average_groups"].values():
-        summary_sheet.append([group["label"], group["spike_count"], group["sheet_name"]])
+        metrics = group["spike_metrics"]
+        summary_sheet.append(
+            [
+                group["label"],
+                group["spike_count"],
+                group["sheet_name"],
+                group["signed_area"],
+                group["absolute_area"],
+                metrics["Baseline y (median)"],
+                metrics["Spike polarity"],
+                metrics["Peak x"],
+                metrics["Peak y"],
+                metrics["Peak amplitude (absolute from baseline)"],
+                metrics["Rise time (10-90%)"],
+                metrics["Decay time (90-10%)"],
+            ]
+        )
 
         average_sheet = workbook.create_sheet(group["sheet_name"])
         average_sheet.append(["x_ms", "average_y"])
@@ -967,6 +1049,65 @@ def export_average_spikes_to_excel(output_path, average_result):
 
     workbook.save(output_path)
     return output_path
+
+
+def select_average_spike_groups(average_result, selected_group_keys):
+    """Return an average-spike result limited to the requested groups."""
+    selected_group_keys = [
+        key for key in selected_group_keys
+        if key in average_result["average_groups"]
+    ]
+    if not selected_group_keys:
+        raise ValueError("Choose at least one detected spike group.")
+
+    average_groups = {
+        key: average_result["average_groups"][key]
+        for key in selected_group_keys
+    }
+    selected_labels = {group["label"] for group in average_groups.values()}
+    selected_spikes = [
+        spike for spike in average_result["spikes"]
+        if spike["average_group"] in selected_labels
+    ]
+    selected_event_rows = [
+        row for row in average_result["event_rows"]
+        if row.get("Average group") in selected_labels
+    ]
+
+    selected_by_file = {}
+    for spike in selected_spikes:
+        selected_by_file[spike["file"]] = selected_by_file.get(spike["file"], 0) + 1
+
+    selected_file_rows = []
+    for row in average_result["file_rows"]:
+        selected_row = dict(row)
+        selected_row["Spikes used"] = selected_by_file.get(row["File"], 0)
+        selected_file_rows.append(selected_row)
+
+    primary_group = max(
+        average_groups.values(),
+        key=lambda group: group["spike_count"],
+    )
+
+    selected_result = dict(average_result)
+    selected_result.update(
+        {
+            "spikes": selected_spikes,
+            "average_groups": average_groups,
+            "primary_group_key": primary_group["key"],
+            "event_rows": selected_event_rows,
+            "file_rows": selected_file_rows,
+            "selected_group_keys": selected_group_keys,
+            "selected_group_labels": [average_groups[key]["label"] for key in selected_group_keys],
+            "positive_alignment_count": int(
+                average_groups.get("positive_peak", {}).get("spike_count", 0)
+            ),
+            "negative_alignment_count": int(
+                average_groups.get("negative_trough", {}).get("spike_count", 0)
+            ),
+        }
+    )
+    return selected_result
 
 
 def save_average_spike_plots(output_path, average_result):
