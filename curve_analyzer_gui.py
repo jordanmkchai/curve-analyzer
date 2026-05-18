@@ -30,7 +30,7 @@ from sinusoidal_fit import (
     load_previous_analysis_workbook,
     load_xy_from_excel,
     make_exact_spline,
-    save_average_spike_plot,
+    save_average_spike_plots,
     sinusoid,
 )
 
@@ -390,7 +390,7 @@ class CurveAnalyzerApp:
             output_plot = first_file.with_name(f"average_epileptiform_spikes_{stamp}.png")
 
             export_average_spikes_to_excel(output_excel, average_result)
-            save_average_spike_plot(output_plot, average_result)
+            output_plots = save_average_spike_plots(output_plot, average_result)
 
             result = self._build_average_spike_analysis_result(
                 output_excel,
@@ -401,11 +401,17 @@ class CurveAnalyzerApp:
 
             self._write_summary(result)
             self._draw_result(result)
+            graph_lines = "\n".join(
+                f"{average_result['average_groups'][key]['label'].title()} graph: {path}"
+                for key, path in output_plots.items()
+            )
             self.output_path_var.set(
-                f"Average spike exported to: {output_excel}\nGraph exported to: {output_plot}"
+                f"Average spikes exported to: {output_excel}\n{graph_lines}"
             )
             self.status_var.set(
-                f"Average complete: {len(average_result['spikes'])} spikes used."
+                "Average complete: "
+                f"{average_result['positive_alignment_count']} positive peak, "
+                f"{average_result['negative_alignment_count']} negative trough spikes."
             )
             self.export_button.configure(state=tk.NORMAL)
             self.open_folder_button.configure(state=tk.NORMAL)
@@ -425,9 +431,10 @@ class CurveAnalyzerApp:
         self.root.update_idletasks()
 
     def _build_average_spike_analysis_result(self, source_file, average_result):
+        primary_group = average_result["average_groups"][average_result["primary_group_key"]]
         x_data, y_data, spline = make_exact_spline(
-            average_result["x_ms"],
-            average_result["average_y"],
+            primary_group["x_ms"],
+            primary_group["average_y"],
         )
         signed_area, absolute_area = calculate_spline_area(spline, x_data[0], x_data[-1])
         spike_metrics = calculate_spike_metrics(x_data, y_data)
@@ -435,14 +442,15 @@ class CurveAnalyzerApp:
 
         metadata_rows = [
             ("Source file", str(source_file)),
-            ("Worksheet", "Average Spike"),
-            ("Analysis mode", "Average TSV epileptiform spike"),
-            ("Spikes averaged", len(average_result["spikes"])),
+            ("Worksheet", primary_group["sheet_name"]),
+            ("Analysis mode", "Average TSV epileptiform spikes by polarity"),
+            ("Displayed average group", primary_group["label"]),
+            ("Spikes averaged in displayed group", primary_group["spike_count"]),
+            ("Spikes analysed total", len(average_result["spikes"])),
             ("Files analysed", len(average_result["file_rows"])),
             ("Pre-peak window (ms)", average_result["pre_ms"]),
             ("Post-peak window (ms)", average_result["post_ms"]),
             ("Spike alignment", average_result.get("alignment", "")),
-            ("Dominant average polarity", average_result.get("dominant_polarity", "")),
             ("Positive aligned spikes", average_result.get("positive_alignment_count", "")),
             ("Negative aligned spikes", average_result.get("negative_alignment_count", "")),
             (
@@ -460,7 +468,8 @@ class CurveAnalyzerApp:
         return {
             "mode": "average_spike",
             "source_file": Path(source_file),
-            "sheet_name": "Average Spike",
+            "sheet_name": primary_group["sheet_name"],
+            "displayed_group_label": primary_group["label"],
             "x": x_data,
             "y": y_data,
             "spline": spline,
@@ -471,6 +480,7 @@ class CurveAnalyzerApp:
             "formula_rows": build_spline_formula_rows(x_data, spline),
             "spike_metrics": spike_metrics,
             "spike_metric_rows": spike_metric_rows,
+            "overlay_spikes": primary_group["spikes"],
             "data_rows": [
                 {"x": float(x_value), "y": float(y_value)}
                 for x_value, y_value in zip(x_data, y_data)
@@ -612,7 +622,7 @@ class CurveAnalyzerApp:
             return "Previous analysis with saved x/y data"
         if result["mode"] == "previous_summary":
             return "Previous workbook summary"
-        return "Average TSV epileptiform spike"
+        return "Average TSV epileptiform spikes by polarity"
 
     def _format_optional_metric(self, label, value):
         if value is None:
@@ -663,7 +673,14 @@ class CurveAnalyzerApp:
             line_label = "Exact interpolated curve"
             if result["mode"] in {"average_spike", "previous_average_spike"}:
                 line_label = "Average spike curve"
-                title = f"Average Epileptiform Spike: {result['source_file'].name}"
+                group_label = result.get("displayed_group_label")
+                if group_label:
+                    title = (
+                        f"Average Epileptiform Spike ({group_label.title()}): "
+                        f"{result['source_file'].name}"
+                    )
+                else:
+                    title = f"Average Epileptiform Spike: {result['source_file'].name}"
             else:
                 title = f"Exact Interpolated Curve: {result['source_file'].name}"
             plot_note = (

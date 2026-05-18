@@ -803,7 +803,7 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
                     "raw_y": segment.copy(),
                     "alignment_amplitude": align_amplitude,
                     "alignment_polarity": align_polarity,
-                    "polarity_flipped": False,
+                    "average_group": align_polarity,
                 }
             )
             event_rows.append(
@@ -815,6 +815,7 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
                     "Alignment shift (ms)": (align_time - float(spike_time)) * 1000.0,
                     "Alignment amplitude": align_amplitude,
                     "Alignment polarity": align_polarity,
+                    "Average group": align_polarity,
                     "Detector": "EEG/ECG analyser",
                     "Saved corrections applied": int(meta.get("eeg_saved_corrections_applied", 0) or 0),
                 }
@@ -842,43 +843,51 @@ def build_average_spike_from_tsvs(file_paths, pre_ms=100.0, post_ms=200.0, progr
     if not aligned_spikes:
         raise ValueError("No complete spikes were detected in the selected TSV files.")
 
-    positive_count = sum(1 for spike in aligned_spikes if spike["alignment_amplitude"] >= 0)
-    negative_count = len(aligned_spikes) - positive_count
-    dominant_sign = 1.0 if positive_count >= negative_count else -1.0
-    dominant_polarity = "positive peak" if dominant_sign > 0 else "negative trough"
+    average_groups = {}
+    for group_key, group_label, sheet_name in [
+        ("positive_peak", "positive peak", "Positive Average Spike"),
+        ("negative_trough", "negative trough", "Negative Average Spike"),
+    ]:
+        group_spikes = [
+            spike for spike in aligned_spikes
+            if spike["average_group"] == group_label
+        ]
+        if not group_spikes:
+            continue
+        y_stack = np.vstack([spike["y"] for spike in group_spikes])
+        average_groups[group_key] = {
+            "key": group_key,
+            "label": group_label,
+            "sheet_name": sheet_name,
+            "x_ms": average_x.copy(),
+            "average_y": np.mean(y_stack, axis=0),
+            "spikes": group_spikes,
+            "spike_count": len(group_spikes),
+        }
 
-    for spike in aligned_spikes:
-        spike_sign = 1.0 if spike["alignment_amplitude"] >= 0 else -1.0
-        if spike_sign != dominant_sign:
-            spike["y"] = -spike["y"]
-            spike["polarity_flipped"] = True
-
-    for row in event_rows:
-        spike_index = int(row["Spike"]) - 1
-        if 0 <= spike_index < len(aligned_spikes):
-            row["Dominant average polarity"] = dominant_polarity
-            row["Polarity flipped for average"] = aligned_spikes[spike_index]["polarity_flipped"]
-
-    y_stack = np.vstack([spike["y"] for spike in aligned_spikes])
-    average_y = np.mean(y_stack, axis=0)
+    positive_count = len(average_groups.get("positive_peak", {}).get("spikes", []))
+    negative_count = len(average_groups.get("negative_trough", {}).get("spikes", []))
+    primary_group = max(
+        average_groups.values(),
+        key=lambda group: group["spike_count"],
+    )
 
     return {
-        "x_ms": average_x,
         "spikes": aligned_spikes,
-        "average_y": average_y,
+        "average_groups": average_groups,
+        "primary_group_key": primary_group["key"],
         "event_rows": event_rows,
         "file_rows": file_rows,
         "pre_ms": float(pre_ms),
         "post_ms": float(post_ms),
         "alignment": "local dominant peak/trough within +/-60 ms of EEG/ECG detector event",
-        "dominant_polarity": dominant_polarity,
         "positive_alignment_count": int(positive_count),
         "negative_alignment_count": int(negative_count),
     }
 
 
 def export_average_spikes_to_excel(output_path, average_result):
-    """Export every aligned spike plus average spike x,y data."""
+    """Export every aligned spike plus separate polarity-specific averages."""
     workbook = Workbook()
     all_sheet = workbook.active
     all_sheet.title = "All Spikes"
@@ -890,7 +899,7 @@ def export_average_spikes_to_excel(output_path, average_result):
             "y",
             "original_y",
             "Alignment polarity",
-            "Polarity flipped for average",
+            "Average group",
         ]
     )
 
@@ -904,15 +913,20 @@ def export_average_spikes_to_excel(output_path, average_result):
                     float(y_value),
                     float(raw_y_value),
                     spike["alignment_polarity"],
-                    bool(spike["polarity_flipped"]),
+                    spike["average_group"],
                 ]
             )
         all_sheet.append([])
 
-    average_sheet = workbook.create_sheet("Average Spike")
-    average_sheet.append(["x_ms", "average_y"])
-    for x_value, y_value in zip(average_result["x_ms"], average_result["average_y"]):
-        average_sheet.append([float(x_value), float(y_value)])
+    summary_sheet = workbook.create_sheet("Average Groups")
+    summary_sheet.append(["Average group", "Spikes averaged", "Worksheet"])
+    for group in average_result["average_groups"].values():
+        summary_sheet.append([group["label"], group["spike_count"], group["sheet_name"]])
+
+        average_sheet = workbook.create_sheet(group["sheet_name"])
+        average_sheet.append(["x_ms", "average_y"])
+        for x_value, y_value in zip(group["x_ms"], group["average_y"]):
+            average_sheet.append([float(x_value), float(y_value)])
 
     events_sheet = workbook.create_sheet("Detected Spikes")
     if average_result["event_rows"]:
@@ -955,29 +969,41 @@ def export_average_spikes_to_excel(output_path, average_result):
     return output_path
 
 
-def save_average_spike_plot(output_path, average_result):
-    """Save overlay plot of all detected spikes and their average."""
-    figure, axis = plt.subplots(figsize=(10, 6), dpi=150)
-    for spike in average_result["spikes"]:
-        axis.plot(spike["x_ms"], spike["y"], color="#1f77b4", alpha=0.18, linewidth=1)
+def save_average_spike_plots(output_path, average_result):
+    """Save one overlay plot per polarity-specific spike group."""
+    output_path = Path(output_path)
+    plot_paths = {}
+    group_styles = {
+        "positive_peak": {"trace": "#c76b00", "average": "#d7191c"},
+        "negative_trough": {"trace": "#1f77b4", "average": "#0047ab"},
+    }
 
-    axis.plot(
-        average_result["x_ms"],
-        average_result["average_y"],
-        color="#d7191c",
-        linewidth=3,
-        label="Average spike",
-    )
-    axis.axvline(0, color="#111111", linestyle=":", linewidth=1, label="Aligned peak/trough")
-    axis.set_title("Peak/trough-aligned epileptiform spikes overlay")
-    axis.set_xlabel("Time from aligned peak/trough (ms)")
-    axis.set_ylabel("Baseline-corrected signal (polarity-normalized)")
-    axis.grid(True)
-    axis.legend()
-    figure.tight_layout()
-    figure.savefig(output_path)
-    plt.close(figure)
-    return output_path
+    for group_key, group in average_result["average_groups"].items():
+        style = group_styles.get(group_key, {"trace": "#666666", "average": "#111111"})
+        plot_path = output_path.with_name(f"{output_path.stem}_{group_key}{output_path.suffix}")
+        figure, axis = plt.subplots(figsize=(10, 6), dpi=150)
+        for spike in group["spikes"]:
+            axis.plot(spike["x_ms"], spike["y"], color=style["trace"], alpha=0.18, linewidth=1)
+
+        axis.plot(
+            group["x_ms"],
+            group["average_y"],
+            color=style["average"],
+            linewidth=3,
+            label=f"{group['label'].title()} average",
+        )
+        axis.axvline(0, color="#111111", linestyle=":", linewidth=1, label="Aligned peak/trough")
+        axis.set_title(f"{group['label'].title()} epileptiform spikes overlay")
+        axis.set_xlabel("Time from aligned peak/trough (ms)")
+        axis.set_ylabel("Baseline-corrected signal")
+        axis.grid(True)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(plot_path)
+        plt.close(figure)
+        plot_paths[group_key] = plot_path
+
+    return plot_paths
 
 
 def load_eeg_ecg_analyser_module():
@@ -1262,34 +1288,95 @@ def load_previous_analysis_workbook(file_path):
         formula_rows = _read_table_rows(workbook, "Formulas")
         source_file = Path(file_path)
 
-        if "Average Spike" in workbook.sheetnames:
-            average_rows = _read_table_rows(workbook, "Average Spike")
-            x_values, y_values = _rows_to_xy(average_rows, "x_ms", "average_y")
-            if x_values is None:
-                raise ValueError("Average Spike sheet does not contain usable x_ms/average_y data.")
-
+        grouped_average_sheets = [
+            ("positive_peak", "positive peak", "Positive Average Spike"),
+            ("negative_trough", "negative trough", "Negative Average Spike"),
+        ]
+        available_group_sheets = [
+            item for item in grouped_average_sheets
+            if item[2] in workbook.sheetnames
+        ]
+        if available_group_sheets or "Average Spike" in workbook.sheetnames:
             overlay_rows = _read_table_rows(workbook, "All Spikes")
-            overlay_spikes = []
-            grouped = {}
+            overlay_groups = {}
             for row in overlay_rows:
                 spike_number = row.get("Spike")
                 x_value = to_float(row.get("x_ms"))
                 y_value = to_float(row.get("y"))
                 if spike_number is None or x_value is None or y_value is None:
                     continue
-                grouped.setdefault(spike_number, {"x": [], "y": []})
-                grouped[spike_number]["x"].append(x_value)
-                grouped[spike_number]["y"].append(y_value)
+                average_group = str(
+                    row.get("Average group")
+                    or row.get("Alignment polarity")
+                    or "average spike"
+                )
+                group = overlay_groups.setdefault(average_group, {})
+                group.setdefault(spike_number, {"x": [], "y": []})
+                group[spike_number]["x"].append(x_value)
+                group[spike_number]["y"].append(y_value)
 
-            for spike_number, values in grouped.items():
-                if len(values["x"]) >= 4:
-                    overlay_spikes.append(
-                        {
-                            "spike_number": spike_number,
-                            "x_ms": np.array(values["x"], dtype=float),
-                            "y": np.array(values["y"], dtype=float),
-                        }
-                    )
+            average_groups = {}
+            if available_group_sheets:
+                for group_key, group_label, sheet_name in available_group_sheets:
+                    average_rows = _read_table_rows(workbook, sheet_name)
+                    group_x, group_y = _rows_to_xy(average_rows, "x_ms", "average_y")
+                    if group_x is None:
+                        continue
+                    overlay_spikes = []
+                    for spike_number, values in overlay_groups.get(group_label, {}).items():
+                        if len(values["x"]) >= 4:
+                            overlay_spikes.append(
+                                {
+                                    "spike_number": spike_number,
+                                    "x_ms": np.array(values["x"], dtype=float),
+                                    "y": np.array(values["y"], dtype=float),
+                                }
+                            )
+                    average_groups[group_key] = {
+                        "key": group_key,
+                        "label": group_label,
+                        "sheet_name": sheet_name,
+                        "x_ms": group_x,
+                        "average_y": group_y,
+                        "spikes": overlay_spikes,
+                        "spike_count": len(overlay_spikes),
+                    }
+            else:
+                average_rows = _read_table_rows(workbook, "Average Spike")
+                group_x, group_y = _rows_to_xy(average_rows, "x_ms", "average_y")
+                if group_x is None:
+                    raise ValueError("Average Spike sheet does not contain usable x_ms/average_y data.")
+                overlay_spikes = []
+                for grouped in overlay_groups.values():
+                    for spike_number, values in grouped.items():
+                        if len(values["x"]) >= 4:
+                            overlay_spikes.append(
+                                {
+                                    "spike_number": spike_number,
+                                    "x_ms": np.array(values["x"], dtype=float),
+                                    "y": np.array(values["y"], dtype=float),
+                                }
+                            )
+                average_groups["legacy_average"] = {
+                    "key": "legacy_average",
+                    "label": "average spike",
+                    "sheet_name": "Average Spike",
+                    "x_ms": group_x,
+                    "average_y": group_y,
+                    "spikes": overlay_spikes,
+                    "spike_count": len(overlay_spikes),
+                }
+
+            if not average_groups:
+                raise ValueError("Average spike workbook does not contain usable average data.")
+
+            primary_group = max(
+                average_groups.values(),
+                key=lambda group: group["spike_count"],
+            )
+            x_values = primary_group["x_ms"]
+            y_values = primary_group["average_y"]
+            overlay_spikes = primary_group["spikes"]
 
             x_values, y_values, spline = make_exact_spline(x_values, y_values)
             signed_area, absolute_area = calculate_spline_area(spline, x_values[0], x_values[-1])
@@ -1297,7 +1384,8 @@ def load_previous_analysis_workbook(file_path):
             return {
                 "mode": "previous_average_spike",
                 "source_file": source_file,
-                "sheet_name": "Average Spike",
+                "sheet_name": primary_group["sheet_name"],
+                "displayed_group_label": primary_group["label"],
                 "x": x_values,
                 "y": y_values,
                 "spline": spline,
@@ -1314,6 +1402,7 @@ def load_previous_analysis_workbook(file_path):
                 "spike_metrics": spike_metrics,
                 "spike_metric_rows": spike_metric_rows or build_spike_metric_rows(spike_metrics),
                 "overlay_spikes": overlay_spikes,
+                "average_groups": average_groups,
                 "data_rows": build_data_rows(x_values, y_values),
             }
 
