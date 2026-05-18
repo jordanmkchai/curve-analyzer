@@ -370,43 +370,59 @@ def iter_tsv_waveform_chunks(file_path, chunk_rows=600000):
     """Yield numeric time/signal chunks from TSV/TXT/CSV files."""
     path = Path(file_path)
     delimiter = "," if path.suffix.lower() == ".csv" else "\t"
+    chunk_rows = int(chunk_rows)
+    x_values = []
+    y_values = []
+    skipped = 0
+    previous_fs = None
+    previous_time_scale = None
 
-    reader = pd.read_csv(
-        path,
-        sep=delimiter,
-        header=None,
-        skiprows=7,
-        usecols=[3, 4],
-        chunksize=int(chunk_rows),
-        engine="c",
-        on_bad_lines="skip",
-    )
+    def build_chunk():
+        nonlocal previous_fs, previous_time_scale
+        x_chunk = np.asarray(x_values, dtype=float)
+        y_chunk = np.asarray(y_values, dtype=float)
 
-    for chunk in reader:
-        x_values = pd.to_numeric(
-            chunk.iloc[:, 0].astype(str).str.strip().str.replace(
-                r"[^0-9eE+\-\.]",
-                "",
-                regex=True,
-            ),
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        y_values = pd.to_numeric(
-            chunk.iloc[:, 1].astype(str).str.strip().str.replace(
-                r"[^0-9eE+\-\.]",
-                "",
-                regex=True,
-            ),
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        valid = np.isfinite(x_values) & np.isfinite(y_values)
-        if not np.any(valid):
-            continue
+        if len(x_chunk) >= 3:
+            fs, t_seconds = infer_sampling_rate_from_time(x_chunk)
+            previous_fs = fs
+            if np.any(x_chunk != 0):
+                nonzero_index = int(np.flatnonzero(x_chunk != 0)[0])
+                previous_time_scale = float(t_seconds[nonzero_index] / x_chunk[nonzero_index])
+            elif previous_time_scale is None:
+                previous_time_scale = 1.0
+            return t_seconds, y_chunk, fs
 
-        x_values = x_values[valid]
-        y_values = y_values[valid]
-        fs, t_seconds = infer_sampling_rate_from_time(x_values)
-        yield t_seconds, y_values, fs, int(np.sum(~valid))
+        if previous_fs is None or previous_time_scale is None:
+            raise ValueError("At least 3 time points are required.")
+
+        return x_chunk * previous_time_scale, y_chunk, previous_fs
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as file:
+        for line in file:
+            parts = line.rstrip("\r\n").split(delimiter)
+            if len(parts) < 5:
+                skipped += 1
+                continue
+
+            x_value = to_float(parts[3])
+            y_value = to_float(parts[4])
+            if x_value is None or y_value is None:
+                skipped += 1
+                continue
+
+            x_values.append(x_value)
+            y_values.append(y_value)
+
+            if len(x_values) >= chunk_rows:
+                t_seconds, y_chunk, fs = build_chunk()
+                yield t_seconds, y_chunk, fs, skipped
+                x_values = []
+                y_values = []
+                skipped = 0
+
+    if x_values:
+        t_seconds, y_chunk, fs = build_chunk()
+        yield t_seconds, y_chunk, fs, skipped
 
 
 def _butter_bandpass_sos(fs, low, high, order=4):
